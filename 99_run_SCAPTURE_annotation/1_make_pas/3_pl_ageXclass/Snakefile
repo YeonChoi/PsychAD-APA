@@ -1,0 +1,339 @@
+import os
+import subprocess
+import pandas as pd
+
+ROOT = Path(workflow.basedir).parents[2] 
+configfile: str(ROOT / 'config.yaml')
+
+TOOLS_DIR = ROOT / config['tools_dir'] 
+SCRATCH_DIR = config['scratch_dir']
+
+"""
+Below is for bam path configuration, specific for PsychAD in Mount Sinai HPC.
+Modify accordingly for your case.
+"""
+
+ORG_BAM_PATH = '/sc/arion/projects/psychAD/STARsolo_bams/round{}/Sample_{}-cDNA/{}-cDNA_Aligned.sortedByCoord.out.bam'
+ORG_BAM_PATH_NOSAMPLE = '/sc/arion/projects/psychAD/STARsolo_bams/round{}/{}-cDNA/{}-cDNA_Aligned.sortedByCoord.out.bam'
+
+def get_bam_path_from_roundnum_poolid(round_num, 
+                                      pool_id, 
+                                      org_bam_path=ORG_BAM_PATH, 
+                                      org_nosample_bam_path=ORG_BAM_PATH_NOSAMPLE): # change some misannotated poolIDs
+    # Handle exceptions here
+    if pool_id == 'NPSAD-145-A1':
+        pool_id = 'NPSAD-145-S1'
+
+    elif pool_id == 'NPSAD-145-A2':
+        pool_id = 'NPSAD-145-S2'
+
+    elif pool_id == 'NPSAD-146-A1':
+        pool_id = 'NPSAD-146-S1'
+
+    elif pool_id == 'NPSAD-146-A2':
+        pool_id = 'NPSAD-146-S2'
+
+    if (int(round_num) == 2) or (int(round_num)==10):
+        return org_nosample_bam_path.format(round_num, pool_id, pool_id)
+    else:
+        return org_bam_path.format(round_num, pool_id, pool_id)
+
+"""
+End of bam path configuration
+"""
+
+# SCAPTURE related
+FASTA = '/sc/arion/projects/CommonMind/yeon/p/APA/ref/GRCh38.nochr/GRCh38.primary_assembly.genome.fa'
+ANNO_NAME = '../anno/SCAPTURE_ensembl.104'
+READ_LEN = '90'
+PAS_SIZE = '350'
+## PolyA Databased given by SCAPTURE. GENCODE + 3 studies
+POLYA_DB = '/sc/arion/projects/CommonMind/yeon/p/APA/ref/SCAPTURE/SupTab_KnownPASs_fourDBs_nochr.txt'
+
+# Subsampling related
+SUBSAMPLE_PREFIX = '../2_subsample_cell_types/age_class_level_5000_cells/'
+SUBSAMPLE_TABLE = pd.read_table(SUBSAMPLE_PREFIX + 'subsampled_poolIDs.tsv', index_col=False)
+
+# toy example
+#BATCH_LIMIT = 10
+#SUBSAMPLE_TABLE = SUBSAMPLE_TABLE.iloc[:BATCH_LIMIT]
+
+# Some helper info
+CELL_TYPES = sorted(SUBSAMPLE_TABLE['age_class'].drop_duplicates()) # Unique set of age X class
+POOL_TABLE = SUBSAMPLE_TABLE[['round_num', 'poolID']].drop_duplicates() # Unique set of files
+
+targets = [
+    #expand('bamsplit/round{round_num}/{pool_id}/splitted_{age_class}.bam', 
+    #        zip,
+    #        round_num=SUBSAMPLE_TABLE['round_num'],
+    #        pool_id=SUBSAMPLE_TABLE['poolID'],
+    #        age_class=SUBSAMPLE_TABLE['class'])
+    expand('peaks/{age_class}/{age_class}.3primeExtended.pas.known.or.pass.bed', age_class=CELL_TYPES),
+    expand('peaks/{age_class}/{age_class}.exonic.pas.known.or.pass.bed', age_class=CELL_TYPES),
+    expand('peaks/{age_class}/{age_class}.intronic.pas.known.or.pass.bed', age_class=CELL_TYPES),
+    'stats/counts_and_subsample_ratio.csv',
+    'stats/subsampled_read_counts.tsv',
+    'peaks/all.pas.pass.bed',
+    'peaks/all.pas.known.or.pass.bed',
+]
+
+
+wildcard_constraints:
+    sample="[^.]*" # Wildcard sample never includes '.'
+
+localrules: all
+
+rule all:
+    input: targets
+
+
+rule split_bam_per_class_sam:
+    input: bam=lambda w: get_bam_path_from_roundnum_poolid(w.round_num, w.pool_id),
+    output: temp(expand('bamsplit/round{{round_num}}/{{pool_id}}/splitted_{age_class}.sam', age_class=CELL_TYPES))
+    params: split_outprefix='bamsplit/round{round_num}/{pool_id}/splitted_',
+            grep_barcodes= SUBSAMPLE_PREFIX + 'barcodes_greplist/round{round_num}_{pool_id}_greplist.txt',
+            python_barcodes= SUBSAMPLE_PREFIX + 'barcodes_with_age_class/round{round_num}_{pool_id}_cell_barcodes_age_class.tsv',
+    threads: 5
+    resources: 
+        mem_mb=1000,
+    run:
+        for age_class in CELL_TYPES:
+            shell('samtools view -H {input.bam} > {params.split_outprefix}{age_class}.sam')
+
+        # MAPQ = 255, for single cell bam in 10X
+        shell('samtools view -@ {threads} {input.bam} -q 255 | \
+               LC_ALL=C grep -F -f {params.grep_barcodes} | \
+               python {TOOLS_DIR}split_bam_by_celltype.py {params.python_barcodes} {params.split_outprefix}')
+
+
+# Process all bams together, to reduce the number of LSF jobs.
+rule convert_split_sam_to_bam:
+    input: expand('bamsplit/round{{round_num}}/{{pool_id}}/splitted_{age_class}.sam', age_class=CELL_TYPES)
+    output: temp(expand('bamsplit/round{{round_num}}/{{pool_id}}/splitted_{age_class}.bam', age_class=CELL_TYPES))
+    threads: 6
+    resources: 
+        mem_mb=1000,
+    run:
+        for insam, outbam in zip(input, output):
+            if insam.split('/')[-1].removesuffix('.sam') != outbam.split('/')[-1].removesuffix('.bam'):
+                raise ValueError('sam and bam cell type is different!\n' + insam + '\n' + outbam)
+            shell('samtools view -b -@ {threads} {insam} > {outbam}')
+
+
+rule merge_bam_per_cell_type:
+    # without \ in expand, it makes error.
+    input: expand('bamsplit/round{round_num}/{pool_id}/splitted_{{age_class}}.bam', \
+                  zip, round_num=POOL_TABLE['round_num'], pool_id=POOL_TABLE['poolID'])
+    output: 'merged_bam/{age_class}.bam'
+    # IO bound job, don't give too much CPUs
+    threads: 1
+    resources: 
+        mem_mb=2000,
+    shell: 'samtools cat -@ {threads} -o {output} {input}'
+
+
+rule count_bam_reads_and_calc_subsample_ratio:
+    input: expand('merged_bam/{age_class}.bam', age_class=CELL_TYPES)
+    #input: expand('merged_bam/{age_class}.sorted.bam', age_class=CELL_TYPES)
+    output: 'stats/counts_and_subsample_ratio.csv'
+    threads: 8
+    resources:
+        mem_mb=2000,
+    run:
+        read_counts = []
+        for ct in CELL_TYPES:
+            cmd = f'samtools view -@ {threads} -c merged_bam/{ct}.bam'
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+            read_counts.append(int(result.stdout))
+
+        df_cnt = pd.DataFrame({ 'cell_type': CELL_TYPES, 'read_counts': read_counts})
+        df_cnt['subsample_ratio'] = (df_cnt['read_counts'].min() / df_cnt['read_counts']).apply(lambda x: '%.3f'%x)
+        df_cnt.to_csv(output[0])
+
+
+rule subsample_bam:
+    input: bam='merged_bam/{age_class}.bam',
+           table='stats/counts_and_subsample_ratio.csv'
+    output: temp('merged_bam/{age_class}.ss.bam')
+    threads: 10
+    resources: 
+        mem_mb=1000,
+    run:
+        df = pd.read_csv(input.table, index_col=0)
+        ss_ratio = df[df['cell_type']==wildcards.age_class]['subsample_ratio'].iloc[0]
+        # Keep random seed = 1
+        shell('samtools view -b -@ {threads} --subsample {ss_ratio} --subsample-seed 1 {input.bam} > {output}')
+
+
+rule sort_merged_subsampled_bam:
+    input: 'merged_bam/{age_class}.ss.bam'
+    output: 'merged_bam/{age_class}.ss.sorted.bam'
+    threads: 10
+    # without enough RAM, many temp files will be generated. Only int can used for -m
+    resources: 
+        mem_mb=10000,
+    shell: 'samtools sort -m 8000M -T {resources.tmpdir} -@ {threads} {input} > {output}'
+
+
+rule index_sorted_bam:
+    input: 'merged_bam/{age_class}.ss.sorted.bam'
+    output: 'merged_bam/{age_class}.ss.sorted.bam.bai'
+    threads: 5
+    resources: 
+        mem_mb=1000,
+    shell: 'samtools index -@ {threads} {input}'
+
+
+rule count_subsampled_reads:
+    input: expand('merged_bam/{age_class}.ss.sorted.bam', age_class=CELL_TYPES)
+    output: 'stats/subsampled_read_counts.tsv'
+    threads: 10
+    resources:
+        mem_mb=1000,
+    run:
+        read_counts = []
+        for ct in CELL_TYPES:
+            cmd = f'samtools view -@ {threads} -c merged_bam/{ct}.ss.sorted.bam'
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+            read_counts.append(int(result.stdout))
+
+        df_cnt = pd.DataFrame({ 'cell_type': CELL_TYPES, 'read_counts': read_counts})
+        df_cnt.to_csv(output[0], sep='\t')
+
+
+# Due to the SCAPTRUE bug, cd into working directory.
+rule scapture_pas_calling:
+    input: bam='merged_bam/{age_class}.ss.sorted.bam',
+           bai='merged_bam/{age_class}.ss.sorted.bam.bai'
+    output: 'peaks/{age_class}/{age_class}.3primeExtended.peaks.evaluated.bed',
+            'peaks/{age_class}/{age_class}.exonic.peaks.evaluated.bed', 
+            'peaks/{age_class}/{age_class}.intronic.peaks.evaluated.bed'
+    conda: config['scapture_env']
+    params: work_dir=os.path.join(SCRATCH_DIR, '{age_class}') + '/',
+            cur_dir=os.getcwd(),
+            out_pref='{age_class}', # Never add dir path in here. SCAPTURE has a bug.
+            out_dir='peaks/{age_class}/',  
+    threads: 48
+    resources: mem_mb=1000 # for 300M bam file, threads * mem_mb > 20,000 
+    shell: 
+        "mkdir -p {params.work_dir}; \
+        cd {params.work_dir}; \
+            scapture -m PAScall \
+            -a {params.cur_dir}/{ANNO_NAME} \
+            -g {FASTA} \
+            -b {params.cur_dir}/{input.bam} \
+            -l {READ_LEN} \
+            -o {params.out_pref} \
+            -p {threads} \
+            --species human \
+            --polyaDB {POLYA_DB}; \
+        cd {params.cur_dir}; \
+        mv {params.work_dir}{params.out_pref}.3primeExtended.peaks.evaluated.bed {params.out_dir};\
+        mv {params.work_dir}{params.out_pref}.intronic.peaks.evaluated.bed {params.out_dir}; \
+        mv {params.work_dir}{params.out_pref}.exonic.peaks.evaluated.bed {params.out_dir} ;\
+        rm -rf {params.work_dir} " # Intermediate files should be removed (~20k files)
+
+
+rule filter_individual_pas:
+    input: 'peaks/{age_class}/{age_class}.3primeExtended.peaks.evaluated.bed',
+           'peaks/{age_class}/{age_class}.exonic.peaks.evaluated.bed', 
+           'peaks/{age_class}/{age_class}.intronic.peaks.evaluated.bed'
+
+    output: 'peaks/{age_class}/{age_class}.3primeExtended.pas.pass.bed',
+            'peaks/{age_class}/{age_class}.3primeExtended.pas.known.or.pass.bed',
+
+            'peaks/{age_class}/{age_class}.exonic.pas.pass.bed', 
+            'peaks/{age_class}/{age_class}.exonic.pas.known.or.pass.bed', 
+
+            'peaks/{age_class}/{age_class}.intronic.pas.pass.bed',
+            'peaks/{age_class}/{age_class}.intronic.pas.known.or.pass.bed',
+
+            'peaks/{age_class}/{age_class}.all.pas.pass.bed',
+            'peaks/{age_class}/{age_class}.all.pas.known.or.pass.bed',
+    threads: 1
+    resources: mem_mb=3000
+    run:
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[13] eq "positive";' {input[0]} > {output[0]}""")
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[12] > 0 | $F[13] eq "positive";' {input[0]} > {output[1]}""")
+
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[13] eq "positive";' {input[1]} > {output[2]}""")
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[12] > 0 | $F[13] eq "positive";' {input[1]} > {output[3]}""")
+
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[13] eq "positive";' {input[2]} > {output[4]}""")
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[12] > 0 | $F[13] eq "positive";' {input[2]} > {output[5]}""")
+
+        shell("cat {output[0]} {output[2]} {output[4]} > {output[6]}")
+        shell("cat {output[1]} {output[3]} {output[5]} > {output[7]}")
+
+
+rule merge_all_pas_write_peak_list:
+    input: expand('peaks/{age_class}/{age_class}.{peak_type}.peaks.evaluated.bed', \
+                   age_class=CELL_TYPES, peak_type=['exonic', 'intronic', '3primeExtended'])
+    output: ext3='3primeExtended.peaklist',
+            exon='exonic.peaklist',
+            intron='intronic.peaklist'
+    threads: 1
+    resources: mem_mb=1000
+    run:
+        ext3_file = open(output.ext3, 'w')
+        exonic_file = open(output.exon, 'w')
+        intronic_file = open(output.intron, 'w')
+
+        for ct in CELL_TYPES:
+            print(ct, f'peaks/{ct}/{ct}.3primeExtended.peaks.evaluated.bed', file=ext3_file, sep='\t')
+            print(ct, f'peaks/{ct}/{ct}.exonic.peaks.evaluated.bed', file=exonic_file, sep='\t')
+            print(ct, f'peaks/{ct}/{ct}.intronic.peaks.evaluated.bed', file=intronic_file, sep='\t')
+
+        ext3_file.close()
+        exonic_file.close()
+        intronic_file.close()
+
+
+rule merge_all_pas_run_scapture:
+    input: ext3='3primeExtended.peaklist',
+           exon='exonic.peaklist',
+           intron='intronic.peaklist'
+    output: ext3='peaks/3primeExtended.Integrated.bed',
+            exon='peaks/exonic.Integrated.bed',
+            intron='peaks/intronic.Integrated.bed'
+    params: ext3='peaks/3primeExtended',
+            exon='peaks/exonic',
+            intron='peaks/intronic'
+    conda: config['scapture_env']
+    threads: 3
+    resources: mem_mb=10000
+    shell: "scapture -m PASmerge -o {params.ext3} --peak {input.ext3};\
+        scapture -m PASmerge -o {params.exon} --peak {input.exon} ;\
+        scapture -m PASmerge -o {params.intron} --peak {input.intron}"
+
+
+rule filter_merged_pas:
+    input: ext3='peaks/3primeExtended.Integrated.bed',
+           exon='peaks/exonic.Integrated.bed',
+           intron='peaks/intronic.Integrated.bed',
+
+    output: 'peaks/3primeExtended.pas.pass.bed',
+            'peaks/3primeExtended.pas.known.or.pass.bed',
+
+            'peaks/exonic.pas.pass.bed', 
+            'peaks/exonic.pas.known.or.pass.bed', 
+
+            'peaks/intronic.pas.pass.bed',
+            'peaks/intronic.pas.known.or.pass.bed',
+
+            'peaks/all.pas.pass.bed',
+            'peaks/all.pas.known.or.pass.bed',
+    threads: 1
+    resources: mem_mb=3000
+    run:
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[13] eq "positive";' {input.ext3} > {output[0]}""")
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[12] > 0 | $F[13] eq "positive";' {input.ext3} > {output[1]}""")
+
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[13] eq "positive";' {input.exon} > {output[2]}""")
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[12] > 0 | $F[13] eq "positive";' {input.exon} > {output[3]}""")
+
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[13] eq "positive";' {input.intron} > {output[4]}""")
+        shell("""perl -alne '$,="\t";print @F[0..11] if $F[12] > 0 | $F[13] eq "positive";' {input.intron} > {output[5]}""")
+
+        shell("cat {output[0]} {output[2]} {output[4]} > {output[6]}")
+        shell("cat {output[1]} {output[3]} {output[5]} > {output[7]}")

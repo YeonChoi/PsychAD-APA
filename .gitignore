@@ -1,0 +1,39 @@
+# Ignore Everything
+*
+
+# Exclude specific files from being ignored (override)
+!.gitignore
+!*.bed
+!*.tsv
+!*.ipynb
+!*.Rmd
+!*.sh
+!*.py
+!*.diff
+!*.R
+!*.html
+!*.yaml
+!*.yml
+!*.md
+!*Snakefile
+!*.smk
+!*README*
+!*Readme*
+!*COMMAND*
+!*Command*
+!LICENSE
+
+# overrides stated above, applies to all dir (root and subdirs - recursively)
+!**/
+
+# Re-Ignore below
+*checkpoint.ipynb
+**/.snakemake/
+**/.ipynb_checkpoints/
+testdata/
+**/__pycache__/
+
+# Ignore Claude Desktop settings
+.claude/*
+*.claude_settings.json
+

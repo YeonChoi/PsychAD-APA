@@ -1,0 +1,20 @@
+__default__:
+    - "-P acc_CommonMind"
+    - "-W 24:00"
+
+copy_bam_head_per_pool:
+    - "-q express"
+    - "-W 2:00"
+
+split_bam_per_class_sam:
+    - "-q private"
+
+convert_split_sam_to_bam:
+    - "-q private"
+
+sort_merged_subsampled_bam:
+    - "-q private"
+
+scapture_pas_calling:
+    - "-q private"
+    - "-W 72:00"

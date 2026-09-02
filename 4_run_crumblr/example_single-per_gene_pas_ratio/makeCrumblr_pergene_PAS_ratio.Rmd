@@ -1,0 +1,242 @@
+---
+title: "Read pseudobulk, make crumblr"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: paged
+    highlight: default
+  html_notebook:
+    toc: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)  
+  library(BiocParallel)
+  library(SingleCellExperiment)
+  library(dreamlet)
+  library(crumblr)
+  library(jsonlite)
+})
+```
+
+```{r}
+CPUParam = MulticoreParam(20)
+register(CPUParam)
+```
+
+# Set params
+```{r}
+GENESIS_DATASET = 'A13_PFC'
+QUANT_LEVEL = 'PAS'
+PSB_LEVEL = 'class'
+PSB_SAMPLE_LEVEL = 'individualID'
+
+MIN_COUNT = 5 # Minimum PAS count required
+MIN_PROP = 0.2 # Required portion of samples >= MIN_COUNT to keep PAS
+
+COBJ_LIST_PATH = sprintf("cobj_list_PAS_usage_%s_%s_%s.rds",
+                         GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+
+# Hardcode cell type order
+if (PSB_LEVEL=='class'){
+  celltypes = c('IN', 'EN', 'Oligo', 'OPC', 'Astro', 'Immune', 'Vascular')
+}
+names(celltypes) = celltypes
+
+PAS_BEDEVAL = '/sc/arion/projects/CommonMind/yeon/p/APA/run_SCAPTURE/5_rename_quantified_PAS/pl_ageXclass/PAS_merged_evaluated_with_name_ageXclass.tsv'
+```
+
+# Load pseudobulk
+```{r}
+pb = sprintf('../../3_run_dreamlet/example_single_%s-%s/%s_counts_%s_%s_%s_pseudobulk.rds', 
+              PSB_LEVEL, QUANT_LEVEL, QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+res.proc = sprintf('../../3_run_dreamlet/example_single_%s-%s/%s_dreamlet_processed_%s_%s_%s_pseudobulk.rds',
+                    PSB_LEVEL, QUANT_LEVEL, QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+
+print(pb)
+print(res.proc)
+```
+
+```{r load data}
+pb = readRDS(pb)
+res.proc = readRDS(res.proc)
+```
+
+```{r}
+res.proc
+```
+
+# Load PAS - Gene info
+```{r}
+pas_gene_table <- read.table(PAS_BEDEVAL, sep='\t', header=1)
+pas_gene_table %>% glimpse()
+```
+
+## Remove if not in count table
+```{r}
+pas_gene_table = pas_gene_table[pas_gene_table$PAS_name %in% rownames(pb), ]
+dim(pas_gene_table)
+```
+
+## Groupby per gene - explode by mapped genes
+```{r}
+# Find PASs mapped to specific gene
+cols_keep = c('PAS_name', 'mapped_genes', 'gene_name', 'visual_name', 'pas_region', 'pas_subclassified')
+
+# Explode table for all mapped genes
+pas_gene_expld <- pas_gene_table[,cols_keep] %>% separate_longer_delim(mapped_genes, delim = ";")
+pas_gene_expld$gene_name = pas_gene_expld$mapped_genes
+cat(dim(pas_gene_table), ' ', dim(pas_gene_expld), '\n')
+```
+
+# Define PAS and sample filter
+## Filter using voom - if one PAS passed, all PAS from same gene
+```{r Test slicing by PB}
+filterList <- bplapply(celltypes, function(ct){
+  rows = rownames(res.proc[[ct]])
+  cols = colnames(res.proc[[ct]])
+  message(sprintf("Processing %s: %d PAS x %d Samples", ct, length(rows), length(cols)))
+  
+  genes = pas_gene_expld %>% filter(PAS_name %in% rows) %>% pull(gene_name) %>% unique()
+  multi_pas_mapping <- pas_gene_expld %>% 
+    filter(gene_name %in% genes) %>%
+    group_by(gene_name) %>%
+    filter(n() > 1) %>%
+    ungroup()
+
+  if (is.null(multi_pas_mapping) || is.null(cols)){
+    return(NULL)
+  } else{
+    return(list(
+      PASs = rows,
+      Samples = cols,
+      Genes = genes,
+      MultiPAS_Genes = unique(multi_pas_mapping$gene_name),
+      All_PASs = unique(multi_pas_mapping$PAS_name)
+    ))
+  }
+})
+
+df_print <- data.frame(
+# Number of PASs passed voom-like filter
+  `Num PAS` = sapply(filterList, function(x) length(x[['All_PASs']])),
+# Number of Genes passed because any(PAS) passed voom-like filter
+  `Num Gene` = sapply(filterList, function(x) length(x[['Genes']])),
+# Number of Samples will be used, each
+  `Num Samples` = sapply(filterList, function(x) length(x[['Samples']]))
+)
+
+print(t(df_print))
+```
+
+# Generate crumblr object per gene
+```{r}
+# Filter by raw counts
+filter_pas_by_counts <- function(df_psb){
+  keep_pas = rowSums(df_psb >= MIN_COUNT) >= MIN_PROP * ncol(df_psb)
+  keep_pas = names(keep_pas[keep_pas])
+  cat('\nRemaining PAS after expression filter: ', length(keep_pas), '\n')
+  keep_pas_by_gene <- pas_gene_expld %>% 
+    filter(PAS_name %in% keep_pas) %>% 
+    select(gene_name, PAS_name) %>% 
+    split(.$gene_name)
+  keep_pas_by_gene <- lapply(keep_pas_by_gene, function(x) x$PAS_name)
+  return(keep_pas_by_gene) 
+}
+```
+
+```{r make cobj}
+cobj_per_celltype = bplapply(celltypes, function(ct){
+  if (is.null(filterList[[ct]])){
+    cat(paste0('\nSkipping empty assay ', ct, '\n'))
+    return()
+  }
+  cat(paste0('\nProcessing ', ct))
+  # Samples 
+  cols = filterList[[ct]]$Samples
+
+  # List of voom filt, multiPAS genes 
+  filt_multipas_genes_ct = filterList[[ct]]$MultiPAS_Genes
+  names(filt_multipas_genes_ct) = filt_multipas_genes_ct
+ 
+  # Get pseudobulk
+  df_psb_ct = assay(pb, ct)[, cols]
+  
+  # Raw count filter 
+  keep_pas_by_gene_ct = filter_pas_by_counts(df_psb_ct)
+  
+  cobj_list <- lapply(filt_multipas_genes_ct, function(gene){
+    rows = keep_pas_by_gene_ct[[gene]]
+    if (length(rows) < 2){
+      return(NULL)
+    }
+    counts = df_psb_ct[rows,cols]
+    cobj = crumblr(t(as.matrix(counts)))
+    return(cobj)
+  })
+  
+  cobj_list = Filter(Negate(is.null), cobj_list) 
+  return(cobj_list)
+})
+
+cat('Number of PAS genes:')
+lapply(cobj_per_celltype, length)  
+```
+
+```{r save each gene cobj}
+cobj_path_each_gene = sub("\\.([^.]+)$", ".split_genes.\\1", COBJ_LIST_PATH)
+saveRDS(cobj_per_celltype, cobj_path_each_gene)
+```
+
+# Merge crumblr objects
+```{r merge crumblr}
+cobj_merged_per_celltype = bplapply(cobj_per_celltype[celltypes], function(cobj_list){
+  
+  # Merge gene and PAS names to make unique identifier
+  new_names = unlist(lapply(names(cobj_list), function(gn) {
+    paste0(gn, '#', rownames(cobj_list[[gn]]))
+  }))
+  
+  # Merge E and weights
+  E_merged = do.call(rbind, lapply(cobj_list, function(x) x$E))
+  W_merged = do.call(rbind, lapply(cobj_list, function(x) x$weights))
+  rownames(E_merged) = new_names
+  rownames(W_merged) = new_names
+  
+  # Use first obj as a template
+  cobj_merged = cobj_list[[1]]
+  cobj_merged$E = E_merged
+  cobj_merged$weights = W_merged
+  
+  return(cobj_merged)
+})
+names(cobj_merged_per_celltype) = celltypes
+```
+
+```{r save cobj}
+saveRDS(cobj_merged_per_celltype, COBJ_LIST_PATH)
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

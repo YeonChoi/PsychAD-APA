@@ -1,0 +1,152 @@
+---
+title: "Read Gene counts, run voom"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+    number_sections: true
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(dreamlet)
+  library(zellkonverter)
+  library(SingleCellExperiment)
+  library(rhdf5)
+  library(tidyverse)
+  library(dplyr)
+  library(SparseArray)
+  library(BiocParallel)
+  library(jsonlite)
+})
+
+```
+
+```{r}
+CPUParam = MulticoreParam(20)
+CPUParam
+```
+
+# Set params
+```{r}
+GENESIS_DATASET = 'A13_PFC'
+QUANT_LEVEL = 'Gene'
+PSB_LEVEL = 'class'
+PSB_SAMPLE_LEVEL = 'individualID'
+```
+
+
+# Set Default paths
+```{r}
+MIN_PROP = 0.2 # for voom
+H5AD_PATH = '/sc/arion/projects/CommonMind/genesis/Single_cell_files/GEN_A13_Kellis/GEN_A13_HARMONIZATION/GEN_A13_ANNOTATION/260212_GEN_A13/GEN_A13_rc2_colFixed.h5ad' 
+
+META_PATH = '/sc/arion/projects/CommonMind/genesis/metadata/outputs/donors_single_cell.csv'
+```
+
+# Load data
+```{r read meta}
+df_meta = read_csv(META_PATH)
+df_meta
+```
+
+```{r read sce h5ad}
+sce <- readH5AD(H5AD_PATH, use_hdf5 = TRUE, raw = TRUE)
+sce
+```
+
+# Make pseudobulk
+```{r copy raw}
+raw_exp = altExp(sce, "raw")
+dim(sce)
+dim(raw_exp)
+dim(sce)==dim(raw_exp)
+
+all(row.names(sce) == row.names(raw_exp))
+all(colnames(sce) == colnames(raw_exp))
+```
+
+```{r}
+assay(sce, "counts") = assay(raw_exp, "X")
+```
+
+```{r make psb}
+pb <- aggregateToPseudoBulk(sce,
+  assay = "counts",
+  cluster_id = PSB_LEVEL,
+  sample_id = PSB_SAMPLE_LEVEL,
+  verbose = FALSE
+)
+```
+
+# Add additional metadata and check values
+```{r}
+idx = match(colnames(pb), df_meta[[PSB_SAMPLE_LEVEL]])
+cols_new = setdiff(names(df_meta), PSB_SAMPLE_LEVEL)
+colData(pb)[cols_new] = df_meta[idx, cols_new]
+
+colData(pb)$DxAD = ifelse(colData(pb)$AD == 1, "AD", ifelse(colData(pb)$Control == 1, "Ctrl", NA))
+colData(pb)$DxAD = factor(colData(pb)$DxAD, levels = c("Ctrl", "AD"))
+
+table(colData(pb)$cerad, useNA='always')
+table(colData(pb)$braak_nft, useNA='always')
+table(colData(pb)$DxAD, useNA='always')
+table(colData(pb)$sex, useNA='always')
+summary(colData(pb)$age)
+```
+
+# Process assays
+```{r}
+# define Voom formula
+form = ~ sex + scale(age) + scale(pmi) + (1|braak_nft) + (1|cerad) + (1|DxAD)  +
+        log(n_genes) + percent_mito + mito_ribo + ribo_genes + (1|individualID)
+
+# If individualID level, remove individualID
+if (PSB_SAMPLE_LEVEL == 'individualID'){
+  form = update(form,  ~ . - (1|individualID))
+}
+
+# If multiple brain bank
+if (length(unique(colData(pb)$Source)) > 1){
+  form = update(form,  ~ . + (1|Source))
+} 
+form
+```
+
+```{r voom and save}
+res.proc <- processAssays(pb, form, BPPARAM=CPUParam, min.prop=MIN_PROP) # difference from previous varPart Ver: rescaleWeightsAfter=TRUE
+
+fittedResPath = sprintf('%s_dreamlet_processed_%s_%s_%s_pseudobulk.rds', QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+saveRDS(res.proc, fittedResPath)
+
+lst = sapply(names(res.proc), function(x){length(assay(res.proc, x)$voom.xy$x)})
+print('Nuber of voom fitted genes:')
+print(lst[order(names(lst))])
+```
+
+```{r save filtered genes and samples}
+filtered_genes <- lapply(names(res.proc), function(ct){row.names(assay(res.proc, ct))})
+filtered_samples <- lapply(names(res.proc), function(ct){colnames(assay(res.proc, ct))})
+filtered_merged <- list(filtered_genes = filtered_genes,
+                        filtered_samples = filtered_samples,
+                        assays = names(res.proc))
+
+write_json(filtered_merged,
+           sprintf("filtered_col_row_names_%s_dreamlet_processed_%s_%s_%s_pseudobulk.json",
+                    QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL), auto_unbox = TRUE)
+```
+
+```{r draw voom, fig.width=12, fig.height=8}
+ncol <- switch(PSB_LEVEL, class = 4, subclass = 7, subtype = 10, NULL)
+plotVoom(res.proc, ncol = ncol)
+
+# Save as PDF
+pdf(paste0("plot_voom_", GENESIS_DATASET, '_', PSB_LEVEL, '_', PSB_SAMPLE_LEVEL, ".pdf"), width = 12, height = 8)
+plotVoom(res.proc, ncol = ncol)
+dev.off()
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```

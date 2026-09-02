@@ -1,0 +1,7 @@
+ml purge
+ml ucsc-utils
+
+bedToGenePred PAS_merged_evaluated_with_visual_names_ageXclass.bed PAS_merged_evaluated_with_visual_names_ageXclass.gp
+genePredToGtf file PAS_merged_evaluated_with_visual_names_ageXclass.gp PAS_merged_evaluated_with_visual_names_ageXclass.gtf
+gzip PAS_merged_evaluated_with_visual_names_ageXclass.gtf
+

@@ -1,0 +1,123 @@
+---
+title: "Read Gene counts, run voom"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+    number_sections: true
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(dreamlet)
+  library(SingleCellExperiment)
+  library(BiocParallel)
+  library(tidyverse)
+})
+```
+
+```{r}
+CPUParam = MulticoreParam(10)
+CPUParam
+```
+
+# Set params
+```{r}
+GENESIS_DATASET = 'A13_PFC'
+QUANT_LEVEL = 'PAS'
+PSB_LEVEL = 'class'
+PSB_SAMPLE_LEVEL = 'individualID'
+```
+
+# Load processed data
+```{r load voom processed}
+# read processed data
+voom_result =  sprintf('../%s_dreamlet_processed_%s_%s_%s_pseudobulk.rds', QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+print(voom_result)
+
+res.proc = readRDS(voom_result)
+res.proc
+```
+
+# Make these ordinal
+```{r}
+colData(res.proc)$cerad = factor(colData(res.proc)$cerad, levels = 1:4, ordered = TRUE)
+colData(res.proc)$braak_nft = factor(colData(res.proc)$braak_nft, levels = 0:6, ordered = TRUE)
+```
+
+
+# Define form
+```{r}
+CONTRAST_TYPE = "NUM" 
+CONTRAST_VAR = 'DxAD'
+CONTRA = c(AD_vs_Ctrl = "DxADAD - DxADCtrl")
+
+form = ~ 0 + DxAD + sex + scale(age) + scale(pmi) + log(n_genes) + percent_mito + mito_ribo + ribo_genes + (1|individualID)
+#contrasts = c(AD_vs_Ctrl = "DxADAD - DxADCtrl")
+
+# If individualID level, remove individualID
+if (PSB_SAMPLE_LEVEL == 'individualID'){
+  form = update(form,  ~ . - (1|individualID))
+}
+
+# If multiple brain bank
+if (length(unique(colData(res.proc)$Source)) > 1){
+  form = update(form,  ~ . + (1|Source))
+} 
+
+print(form)
+```
+
+# run dreamlet
+```{r dreamlet}
+fit = dreamlet(res.proc, form, contrasts = CONTRA, BPPARAM = SerialParam())
+```
+
+
+```{r check contrast}
+# Used for topTable
+if(CONTRAST_TYPE == "ORD" ){
+  pattern = paste0("^", CONTRAST_VAR)
+  coef.test = grep(pattern, colnames(fit[[1]]$coefficients), value=TRUE)
+}else{     
+  coef.test = names(CONTRA)
+}
+print(coefNames(fit))
+names(coef.test) = coef.test
+print(coef.test)
+```
+
+```{r save top table}
+for (coef_key in coef.test) {
+  tab = topTable(fit, coef = coef_key, number = Inf) %>%
+    as_tibble(rownames = "feature") %>%
+    mutate(coef = coef_key)
+
+  file = paste0("topTable_", coef_key, ".tsv.gz")
+  write_tsv(tab, file)
+  print(paste0("Saved: ", file))
+}
+```
+
+```{r save RDS}
+saveRDS(fit, file = 'dreamlet_result.rds')
+```
+
+```{r plot volcano, fig.width=12, fig.height=16}
+ncol = switch(PSB_LEVEL, class = 4, subclass = 7, subtype = 10, NULL)
+for (coef_key in coef.test) {
+  print(paste0("Drawing volcano for :", coef_key))
+  pdf_file = paste0("volcano_plot_DEG_", coef_key, '_', GENESIS_DATASET, '_', PSB_LEVEL, '_', PSB_SAMPLE_LEVEL, ".pdf")
+
+  g = plotVolcano(fit, coef = coef_key, ncol = ncol)
+  ggsave(filename = pdf_file, plot = g, width = 12, height = 12, device = "pdf")
+
+  print(g)
+}
+```
+
+# Session info
+```{r}
+sessionInfo()
+```
+

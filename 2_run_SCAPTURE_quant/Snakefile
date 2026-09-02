@@ -1,0 +1,107 @@
+import os
+import pandas as pd
+import pickle
+import sys
+from pathlib import Path
+
+ROOT = Path(workflow.basedir).parent
+configfile: str(ROOT / 'config.yaml')
+
+SCAPTURE_BED = ROOT / config['pas_anno_bed'] # Annotation made by SCAPTURE
+BC_PATH = ROOT / config['barcode_table'] # Cell barcodes and samples
+TOOLS_DIR = ROOT / config['tools_dir']
+include: TOOLS_DIR / 'snake_helpers.smk'
+
+df_barcodes = read_table(BC_PATH) # from snake_helpers, read any type of table
+
+# Only Channel is considered here. Modify for Brain region or individualID if needed.
+df_channels = df_barcodes[['Channel', 'snRNA_bam']].drop_duplicates().set_index(['Channel']).sort_index()
+se_barcodes = df_barcodes.set_index(['Channel']).sort_index()['cell_barcode']
+channels = list(df_channels.index)
+
+def get_snRNA_bam(channel):
+    return df_channels.loc[channel, 'snRNA_bam']
+
+targets = [
+    expand('counts/{channel}/{channel}.KeepCell.UMIs.tsv.gz', channel=channels),
+    expand('logs/{channel}.tmp_removed', channel=channels),
+    'stats/merged_count.txt',
+]
+
+wildcard_constraints:
+    channel="[^.]*", # Wildcard sample never includes '.'
+
+localrules: all
+
+rule all:
+    input: targets
+
+rule write_barcodes:
+    output: temp('bc/{channel}.txt')
+    threads: 1
+    resources: mem_mb=4000
+    run:
+        with open(output[0], 'w') as outfile:
+            for bc in se_barcodes.loc[wildcards.channel]:
+                print(bc.removeprefix('CB:Z:'), file=outfile)
+
+
+rule scapture_pas_quant:
+    input: bam=lambda wc: get_snRNA_bam(wc.channel),
+           barcodes='bc/{channel}.txt'
+    output: counts='counts/{channel}/{channel}.KeepCell.UMIs.tsv.gz',
+            bam='counts/{channel}/{channel}.KeepCell.reassigned.bam'
+    params: outpref= lambda wildcards, output: output[0].removesuffix('.KeepCell.UMIs.tsv.gz') # function should always take wildcards.
+    threads: 6
+    conda: config['scapture_env']
+    resources: mem_mb=12000
+    shell:
+        "scapture -m PASquant \
+                  -b {input.bam} \
+                  -p {threads} \
+                  --celllist {input.barcodes} \
+                  --pas {SCAPTURE_BED} \
+                  -o {params.outpref}"
+
+
+rule count_assigned_reads:
+    input: 'counts/{channel}/{channel}.KeepCell.reassigned.bam'
+    output: temp('stats/{channel}.pas_assigned.count.txt')
+    # function should always take wildcards.
+    threads: 5
+    resources: mem_mb=4000
+    shell:
+        'samtools view -@ 3 {input[0]} | cut -f 20- | python {TOOLS_DIR}/check_assigned.py {wildcards.channel} > {output}'
+
+
+rule merge_assigned_read_count:
+    input: expand('stats/{channel}.pas_assigned.count.txt', channel=channels),
+    output: 'stats/merged_count.txt'
+    threads: 1
+    resources: mem_mb=4000
+    shell:
+        'cat {input} > {output}'
+
+
+rule remove_scapture_temp:
+    input: 'counts/{channel}/{channel}.KeepCell.UMIs.tsv.gz', # Don't remove before counting is over
+           'stats/{channel}.pas_assigned.count.txt'
+    output: 'logs/{channel}.tmp_removed'
+    params: inpref= lambda wildcards, input: input[0].removesuffix('.KeepCell.UMIs.tsv.gz') # function should always take wildcards.
+    resources: mem_mb=4000
+    run:
+        extensions = [
+            '.KeepCell.srt.bam',
+            '.KeepCell.FilterBam.log',
+            '.KeepCell.summary',
+            '.KeepCell.reassigned.bam',
+            '.KeepCell.reassigned.bam.bai',
+            '.KeepCell.UMItools.error.log',
+            '.KeepCell.UMItools.logging.log',
+        ]
+
+        for ext in extensions:
+            target = params.inpref + ext
+            shell('rm -vf {target}')
+
+        shell('touch {output}')

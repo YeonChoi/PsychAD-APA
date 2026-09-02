@@ -1,0 +1,271 @@
+---
+title: "Read Gene counts, run voom"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+    number_sections: true
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(dreamlet)
+  library(zellkonverter)
+  library(SingleCellExperiment)
+  library(rhdf5)
+  library(tidyverse)
+  library(dplyr)
+  library(SparseArray)
+  library(BiocParallel)
+  library(jsonlite)
+})
+
+```
+
+```{r}
+CPUParam = MulticoreParam(20)
+CPUParam
+```
+
+# Set params
+```{r}
+GENESIS_DATASET = 'A13_PFC'
+QUANT_LEVEL = 'PAS'
+PSB_LEVEL = 'class'
+PSB_SAMPLE_LEVEL = 'individualID'
+```
+
+# Set Default paths
+```{r}
+MIN_PROP = 0.2 # for voom
+#H5AD_PATH = '/sc/arion/projects/CommonMind/genesis/Single_cell_files/GEN_A13_Kellis/GEN_A13_HARMONIZATION/GEN_A13_ANNOTATION/260212_GEN_A13/GEN_A13_rc2_colFixed.h5ad' 
+
+BASE_PATH = sprintf('/sc/arion/projects/CommonMind/yeon/p/APA_GENESIS/run_SCAPTURE/%s', GENESIS_DATASET)
+GEN_PREFIX = strsplit(GENESIS_DATASET, '_')[[1]][1] # 'A13_PFC' -> 'A13'
+
+H5AD_PATH = sprintf('%s/singlecell_counts/GEN_%s_rc2_colFixed_%s.h5ad', BASE_PATH, GEN_PREFIX, QUANT_LEVEL)
+PAS_INFO_PATH = sprintf('%s/singlecell_counts/PAS_info_for_rowdata_all.csv.gz', BASE_PATH)
+PSB_CNT_PREFIX = sprintf('%s/psb/count_no_cutoff/%s/PAS_read_count_', BASE_PATH, PSB_LEVEL)
+
+META_PATH = '/sc/arion/projects/CommonMind/genesis/metadata/outputs/donors_single_cell.csv'
+```
+
+```{r read metadata}
+df_meta = read_csv(META_PATH, guess_max = Inf)
+colnames(df_meta)
+```
+
+# Load h5ad for coldata and metadata
+```{r read obs var}
+read_obsvar <- function(path, sub='obs'){
+  dat = h5read(path,sub)
+  l = sapply(dat,length)
+  dat1 = do.call(data.frame,lapply(dat[l==2], function(x)c(NA,x$categories)[x$codes+2]))
+  dat2 = do.call(data.frame,dat[l!=2])
+  dat = data.frame(dat1, dat2)
+  rownames(dat) = dat$X_index
+  dat
+}
+
+# Obs: for both coldata and metadata
+obsTable = read_obsvar(H5AD_PATH, 'obs')
+colnames(obsTable)
+```
+
+# Load PAS info, for var table
+```{r}
+varTable = read.csv(PAS_INFO_PATH, row.names=1, header=TRUE)
+head(varTable)
+```
+
+#Load CSV files into list of X
+```{r}
+unique(obsTable[[PSB_LEVEL]])
+```
+
+```{r read pseudobulk csv}
+pbList = list()
+
+for (sc in unique(obsTable[[PSB_LEVEL]])){
+  print(paste('Reading: ', sc))
+  fn = paste0(PSB_CNT_PREFIX, sc, '_', PSB_SAMPLE_LEVEL, '.csv.gz')
+  pbList[[sc]] = as(readSparseCSV(fn), "dgCMatrix")
+}
+# Print example
+m = pbList[['Astro']][1:10, 1:4]
+colnames(m) <- paste0('donor', seq_len(ncol(m)))
+m
+```
+
+# Define a function making a pseudo-bulk object
+```{r}
+read_pseudo_bulk <- function(pbList, Adobs, Advar, by){
+  Advar = S4Vectors::DataFrame(Advar[rownames(pbList[[1]]),])
+  Adobs = S4Vectors::DataFrame(Adobs)
+  
+  md = list()
+  md$agg_pars = list(assay = 'counts', by = by, fun = 'sum', scale = FALSE)
+  
+  pb = SingleCellExperiment(pbList, rowData = Advar, metadata = md)
+  cd = data.frame(Adobs[, by, drop = FALSE])
+  
+  # If any columns is categorical, remove unused category.
+  for (i in names(cd)) {
+      if (is.factor(cd[[i]])) {
+          cd[[i]] <- droplevels(cd[[i]])
+      }
+  }
+  
+  # Make cell count into list of list
+  ns <- table(cd) # Make A, B column table to A X B count table
+  if (length(by) == 2) {
+      ns <- asplit(ns, 2)
+      ns <- purrr::map(ns, ~ c(unclass(.)))
+  } else {
+      ns <- c(unclass(ns))
+  }
+  int_colData(pb)$n_cells <- ns
+
+  # keep columns only if there is a unique value in each sample
+  if (length(by) == 2) {
+      cd <- Adobs
+      ids <- colnames(pb)
+      
+      counts <- vapply(ids, function(u) {
+          m <- as.logical(match(cd[, by[2], drop = TRUE], u, nomatch = 0))
+          vapply(cd[m, ], function(u) length(unique(u)), numeric(1))
+      }, numeric(ncol(Adobs)))
+      cd_keep <- apply(counts, 1, function(u) all(u == 1))
+      cd_keep <- setdiff(names(which(cd_keep)), by)
+      
+      if (length(cd_keep) != 0) {
+          m <- match(ids, cd[, by[2]], nomatch = 0)
+          cd <- cd[m, cd_keep, drop = FALSE]
+          rownames(cd) <- ids
+          colData(pb) <- cd
+      }
+  }
+
+  # Make metadata
+  # Per sample, per cell type
+  # compute mean of each continuous column in colData
+
+  # Get columns that are numeric (or integers), but not factor
+  cols <- vapply(Adobs, function(a) is.numeric(a) & !is.factor(a), logical(1))
+  cols <- names(cols[cols])
+  # exclude columns in by and already in colData(pb)
+  cols <- cols[!(cols %in% by)]
+  cols <- cols[!cols %in% colnames(colData(pb))]
+ 
+  # per sample, per cell type
+  # report mean of value
+  # if a sample_id is not observed for a cell type, report NA 
+  df <- Adobs %>% 
+            as_tibble() %>%
+            group_by_at(vars(metadata(pb)$agg_pars$by)) %>%
+            summarise_at(cols, mean, na.rm = TRUE)
+
+  # Already grouped for PSB_LEVEL(class/subclass..), so only complete the sample level.
+  sample_id <- metadata(pb)$agg_pars$by[2]
+  if (!is.na(sample_id)) {
+  # fill in missing data if sample_id is defined
+    df[[sample_id]] <- as.factor(df[[sample_id]])
+    df <- df %>% complete(!!sym(sample_id))
+  }
+  metadata(pb)$aggr_means <- df
+  
+  # Convert 'by' columns into factors               
+  for (col in metadata(pb)$agg_pars$by){
+      metadata(pb)$aggr_means[[col]] <- as.factor(metadata(pb)$aggr_means[[col]])
+  }
+
+  return(pb)
+}
+```
+
+# Make pseudo-bulk by celltype and sample
+```{r make pseudobulk}
+by = c(PSB_LEVEL, PSB_SAMPLE_LEVEL)
+pb = read_pseudo_bulk(pbList=pbList, Adobs=obsTable, Advar=varTable, by=by)
+# Free some memory
+rm(pbList)
+```
+
+# Add additional metadata and check values
+```{r}
+idx = match(colnames(pb), df_meta[[PSB_SAMPLE_LEVEL]])
+cols_new = setdiff(names(df_meta), PSB_SAMPLE_LEVEL)
+colData(pb)[cols_new] = df_meta[idx, cols_new]
+
+colData(pb)$DxAD = ifelse(colData(pb)$AD == 1, "AD", ifelse(colData(pb)$Control == 1, "Ctrl", NA))
+colData(pb)$DxAD = factor(colData(pb)$DxAD, levels = c("Ctrl", "AD"))
+
+table(colData(pb)$cerad, useNA='always')
+table(colData(pb)$braak_nft, useNA='always')
+table(colData(pb)$DxAD, useNA='always')
+table(colData(pb)$sex, useNA='always')
+summary(colData(pb)$age)
+```
+
+# Save pseudobulk
+```{r save pseudobulk}
+pbPath = sprintf('%s_counts_%s_%s_%s_pseudobulk.rds', QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+saveRDS(pb, pbPath)
+```
+
+# Fit model for normalization
+```{r}
+# define Voom formula
+form = ~ sex + scale(age) + scale(pmi) + (1|braak_nft) + (1|cerad) + (1|DxAD)  +
+        log(n_genes) + percent_mito + mito_ribo + ribo_genes + (1|individualID)
+
+# If individualID level, remove individualID
+if (PSB_SAMPLE_LEVEL == 'individualID'){
+  form = update(form,  ~ . - (1|individualID))
+}
+
+# If multiple brain bank
+if (length(unique(colData(pb)$Source)) > 1){
+  form = update(form,  ~ . + (1|Source))
+} 
+form
+```
+
+## Process assays
+```{r voom and save}
+res.proc <- processAssays(pb, form, BPPARAM=CPUParam, min.prop=MIN_PROP)
+
+fittedResPath = sprintf('%s_dreamlet_processed_%s_%s_%s_pseudobulk.rds', QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+saveRDS(res.proc, fittedResPath)
+
+lst = sapply(names(res.proc), function(x){length(assay(res.proc, x)$voom.xy$x)})
+print('Nuber of voom fitted genes:')
+print(lst[order(names(lst))])
+```
+
+```{r save filtered genes and samples}
+filtered_genes <- lapply(names(res.proc), function(ct){row.names(assay(res.proc, ct))})
+filtered_samples <- lapply(names(res.proc), function(ct){colnames(assay(res.proc, ct))})
+filtered_merged <- list(filtered_genes = filtered_genes,
+                        filtered_samples = filtered_samples,
+                        assays = names(res.proc))
+
+write_json(filtered_merged,
+           sprintf("filtered_col_row_names_%s_dreamlet_processed_%s_%s_%s_pseudobulk.json",
+                    QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL), auto_unbox = TRUE)
+```
+
+```{r draw voom, fig.width=12, fig.height=8}
+ncol <- switch(PSB_LEVEL, class = 4, subclass = 7, subtype = 10, NULL)
+plotVoom(res.proc, ncol = ncol)
+
+# Save as PDF
+pdf(paste0("plot_voom_", GENESIS_DATASET, '_', PSB_LEVEL, '_', PSB_SAMPLE_LEVEL, ".pdf"), width = 12, height = 8)
+plotVoom(res.proc, ncol = ncol)
+dev.off()
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```

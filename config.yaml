@@ -1,0 +1,23 @@
+# config.yaml
+# Paths are relative to this file (the repository root); the code joins them
+# to the root itself. Absolute paths also work.
+
+dataset_id: apa_test
+
+# --- Inputs: point these at your own data --------------------------------
+gene_h5ad: testdata/GEN_A13_rc2_colFixed.h5ad
+
+# --- Helper functions ----------------------------------------------------
+tools_dir: helpers/
+
+# --- Reference: shipped in ref/ ------------------------------------------
+pas_anno_bed: ref/all_passed_merged_PAS-ageXclass.bed
+pas_info_tsv: ref/PAS_merged_evaluated_with_name_ageXclass.tsv
+
+# --- Made by 1_barcode_tables/make_barcode_tables.ipynb -------------------
+barcode_table: 1_barcode_tables/apa_test_bam_path_and_barcodes.parquet
+
+# Conda env name for SCAPTURE
+scapture_env: SCAPTURE_env
+# Scratch dir for 99_run_SCAPTURE_annotation.
+scratch_dir: /tmp/scapture

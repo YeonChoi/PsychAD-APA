@@ -1,0 +1,173 @@
+diff --git a/SCAPTURE_env.yml b/SCAPTURE_env.yml
+index d332df4..38cf6ae 100644
+--- a/SCAPTURE_env.yml
++++ b/SCAPTURE_env.yml
+@@ -31,7 +31,6 @@ dependencies:
+   - cairo=1.16.0=hcf35c78_1003
+   - certifi=2021.5.30=py37h89c1867_0
+   - cudatoolkit=10.0.130=hf841e97_7
+-  - cudnn=7.6.5=cuda10.0_0
+   - curl=7.71.1=he644dc0_3
+   - cycler=0.10.0=py_2
+   - dropseq_tools=2.4.0=0
+@@ -323,4 +322,3 @@ dependencies:
+     - werkzeug==1.0.1
+     - wrapt==1.12.1
+     - zipp==3.4.0
+-prefix: ~/SCAPTURE_env
+diff --git a/scapture b/scapture
+old mode 100644
+new mode 100755
+index 93b74be..77d9a35
+--- a/scapture
++++ b/scapture
+@@ -210,7 +210,7 @@ if [ "$MODULE" == "PAScall" ]; then
+ 	fi
+ 	
+ 	#echo -n "scapture PAScall: estimate gene expression, and filter out gene without reads."; date
+-	featureCounts -a $ANNO".genetype.gtf" -g transcript_id -Q 3 -s 1 -M -O --fraction -T 4 -o $PREFIX".featureCount.txt" $BAMFILE &> $PREFIX".featureCount.log"	
++	featureCounts -a $ANNO".genetype.gtf" -g transcript_id -Q 3 -s 1 -M -O --fraction -T $MEGAthread -o $PREFIX".featureCount.txt" $BAMFILE &> $PREFIX".featureCount.log"	
+ 	cat $PREFIX".featureCount.txt" | perl -alne 'if($#ARGV==0){next if $_ =~ /^#/ | $F[0] eq "Geneid"; @s=split(/\|/,$F[0]); $count{$F[0]}=$F[$#F];}else{ $c=0;$c=$count{$F[0]} if $count{$F[0]}; $,="\t"; print $c,@F; }' - $ANNO".genetype.txt" > $PREFIX".genetype.count.txt"
+ 	
+ 	#echo -n "scapture PAScall: create command line for transcript level peak calling."; date
+@@ -225,7 +225,8 @@ fi
+ 
+ if [ "$MODULE" == "PAScall2" ]; then
+ 	echo -n "scapture PAScall: peak calling. "; date
+-	cat $PREFIX".CallPasPerGene.sh" | parallel -j $MEGAthread &> /dev/null
++	cat $PREFIX".CallPasPerGene.sh" | parallel -j $MEGAthread #&> call_pas_per_gene.log
++	echo -n "scapture PAScall: Call PAS per gene is done. "; date # Added by me
+ 	wait
+ 	GeneList=$(perl -alne '@s=split(/\|/,$F[1]);$gene{"$s[0]"}+=$F[0]; END{for $g (keys %gene){print $g if $gene{$g} > 0;}}' $PREFIX".genetype.count.txt" )
+ 	wait
+diff --git a/scapture_annotation b/scapture_annotation
+old mode 100644
+new mode 100755
+diff --git a/scapture_callpeak b/scapture_callpeak
+old mode 100644
+new mode 100755
+index aea5d6d..ad50911
+--- a/scapture_callpeak
++++ b/scapture_callpeak
+@@ -233,5 +233,5 @@ echo "After aggregating: "$PREFIX"."$GeneName".intronic.peak.aggregate.bed"
+ echo "After expression filering: "$PREFIX"."$GeneName".intronic.peaks.bed" 
+ COMMENT
+ 
+-#echo "scapture_callpeak: Remove temp files at the end ("$PREFIX"."$GeneName")"
++echo "scapture_callpeak: Remove temp files at the end ("$PREFIX"."$GeneName")"
+ clearTempIntronFiles $PREFIX $GeneName
+diff --git a/scapture_evaluate b/scapture_evaluate
+old mode 100644
+new mode 100755
+diff --git a/scapture_mergesample b/scapture_mergesample
+old mode 100644
+new mode 100755
+index 5ef54e3..cd1ec14
+--- a/scapture_mergesample
++++ b/scapture_mergesample
+@@ -77,33 +77,48 @@ else
+ fi
+ 
+ 
++echo 'running modified version!'
+ #Label sample in name field, then cat peaks from samples together
+-PeakCombine=$(cat $PeakFileList | parallel -j 1 --colsep="\t" perl -alne \''$F[3]="$F[3]|{1}";$,="\t";print @F;'\' {2} | sort -k1,1 -k2,2n)
++cat $PeakFileList | parallel -j 1 --colsep="\t" perl -alne \''$F[3]="$F[3]|{1}";$,="\t";print @F;'\' {2} | sort -k1,1 -k2,2n > $PREFIX".PeakCombine"
++
+ 
+ #extract center region (60%) of peaks to perform overlap analysis
+-PeakCentre=$( echo "$PeakCombine" | bedToGenePred /dev/stdin /dev/stdout | perl -alne '$r=0.6;  $ratio=int(1/((1-$r)/2)); $d=0;@s=split(",",$F[8]);@e=split(",",$F[9]); for($i=0;$i<$F[7];$i++){$d += ($e[$i]-$s[$i]);};    $startexon=0;$startdis=0;$dis = int($d/$ratio);for($i=0;$i<$F[7];$i++){ $dis -= ($e[$i]-$s[$i]); if($dis < 0){ $startdis = $e[$i] - $s[$i] + $dis; $startexon = $i+1; last;}; };   $endexon=$F[7]-1;$enddis=0;$dis = int($d/$ratio);for($i=$F[7]-1;$i>=0;$i--){ $dis -= ($e[$i]-$s[$i]); if($dis < 0){ $enddis = $e[$i] - $s[$i] + $dis; $endexon = $i + 1;last;}; };  $,="\t"; $s[$startexon-1] += $startdis; $e[$endexon-1] -= $enddis; print $F[0],$F[1],$F[2],$s[$startexon-1],$e[$endexon-1],$e[$endexon-1],$e[$endexon-1],$endexon-$startexon+1,join(",",@s[$startexon-1..$endexon-1]),join(",",@e[$startexon-1..$endexon-1]);' | genePredToBed /dev/stdin /dev/stdout)
+-echo "$PeakCentre" > $PREFIX".peakcenter.bed"
++#PeakCentre=$( echo "$PeakCombine" | bedToGenePred /dev/stdin /dev/stdout | perl -alne '$r=0.6;  $ratio=int(1/((1-$r)/2)); $d=0;@s=split(",",$F[8]);@e=split(",",$F[9]); for($i=0;$i<$F[7];$i++){$d += ($e[$i]-$s[$i]);};    $startexon=0;$startdis=0;$dis = int($d/$ratio);for($i=0;$i<$F[7];$i++){ $dis -= ($e[$i]-$s[$i]); if($dis < 0){ $startdis = $e[$i] - $s[$i] + $dis; $startexon = $i+1; last;}; };   $endexon=$F[7]-1;$enddis=0;$dis = int($d/$ratio);for($i=$F[7]-1;$i>=0;$i--){ $dis -= ($e[$i]-$s[$i]); if($dis < 0){ $enddis = $e[$i] - $s[$i] + $dis; $endexon = $i + 1;last;}; };  $,="\t"; $s[$startexon-1] += $startdis; $e[$endexon-1] -= $enddis; print $F[0],$F[1],$F[2],$s[$startexon-1],$e[$endexon-1],$e[$endexon-1],$e[$endexon-1],$endexon-$startexon+1,join(",",@s[$startexon-1..$endexon-1]),join(",",@e[$startexon-1..$endexon-1]);' | genePredToBed /dev/stdin /dev/stdout)
++# Modified by Yeon Choi; center region = 100%, not 60%. overlap = 0.3, not 0.6. Save bedtools output for performance.
++cat $PREFIX".PeakCombine" | bedToGenePred /dev/stdin /dev/stdout | genePredToBed /dev/stdin /dev/stdout > $PREFIX".peakcenter.bed"
++bedtools intersect -a $PREFIX".peakcenter.bed" -b $PREFIX".peakcenter.bed" -s -f 0.3 -split -wao -sorted  > $PREFIX".peakcenter.intersect"
+ 
+ #assign identical ID to peaks with overlapped center region.
+-PeakCentrOverlap=$(bedtools intersect -a $PREFIX".peakcenter.bed" -b $PREFIX".peakcenter.bed" -s -split -f 0.6 -wao | perl -alne '@a=split(/\|/,$F[3]);@b=split(/\|/,$F[15]);next if $a[0] ne $b[0];print;' | sort -k4,4 -k16,16 | perl -alne 'BEGIN{$,="\t";$n=1;$m=0;}; $m++; $a=$F[3];$b=$F[15]; $g{$F[3]}=join("\t",@F[0..11]);$g{$F[15]}=join("\t",@F[12..23]); if($m==1){$c{$a}=$n;$c{$b}=$n;next;}; if( $c{$a} && $c{$b} ){ next; }; if( !$c{$a} && $c{$b} ){ $c{$a}=$c{$b};next; }; if( $c{$a} && !$c{$b} ){ $c{$b}=$c{$a};next; }; if( !$c{$a} && !$c{b} ){ $n++; $c{$a}=$n;$c{$b}=$n;next; };  END{for $k (keys %c){print $g{$k},$c{$k}};}' | sort -k13,13n -k1,1 -k2,2n)
+-PeakOverlap=$(echo "$PeakCentrOverlap" | perl -alne 'if($#ARGV==0){$g{$F[3]}=$F[12];}else{$,="\t";print @F,$g{$F[3]};}' - <(echo "$PeakCombine" ) | sort -k1,1 -k2,2n)
+-PeakOverlapNum=$(perl -alne 'if($#ARGV==0){$n{$F[$#F]}+=1;}else{$,="\t"; @a=split(/\|/,$F[3]); print @F,$n{$F[$#F]};}' <(echo "$PeakOverlap") <(echo "$PeakOverlap") | sort -k1,1 -k2,2n)
++echo 'calculating peak center overlap!'
++cat $PREFIX".peakcenter.intersect" | perl -alne '@a=split(/\|/,$F[3]);@b=split(/\|/,$F[15]);next if $a[0] ne $b[0];print;' | sort --parallel=4 -k4,4 -k16,16 | perl -alne 'BEGIN{$,="\t";$n=1;$m=0;}; $m++; $a=$F[3];$b=$F[15]; $g{$F[3]}=join("\t",@F[0..11]);$g{$F[15]}=join("\t",@F[12..23]); if($m==1){$c{$a}=$n;$c{$b}=$n;next;}; if( $c{$a} && $c{$b} ){ next; }; if( !$c{$a} && $c{$b} ){ $c{$a}=$c{$b};next; }; if( $c{$a} && !$c{$b} ){ $c{$b}=$c{$a};next; }; if( !$c{$a} && !$c{b} ){ $n++; $c{$a}=$n;$c{$b}=$n;next; };  END{for $k (keys %c){print $g{$k},$c{$k}};}' | sort --parallel=4 -k13,13n -k1,1 -k2,2n > $PREFIX".PeakCenterOverlap"
++echo 'calculating peak center overlap done!'
++cat $PREFIX".PeakCenterOverlap" | perl -alne 'if($#ARGV==0){$g{$F[3]}=$F[12];}else{$,="\t";print @F,$g{$F[3]};}' - <(cat $PREFIX".PeakCombine" ) | sort --parallel=4 -k1,1 -k2,2n > $PREFIX".PeakOverlap"
++echo 'calculating peak overlap done!'
++perl -alne 'if($#ARGV==0){$n{$F[$#F]}+=1;}else{$,="\t"; @a=split(/\|/,$F[3]); print @F,$n{$F[$#F]};}' <(cat $PREFIX".PeakOverlap") <(cat $PREFIX".PeakOverlap") | sort --parallel=4 -k1,1 -k2,2n > $PREFIX".PeakOverlapNum"
++echo 'adding peak overlap number done!'
+ 
+ if [[ "$PeakList" == "NULL" && "$RawPeakList" != "NULL" ]]; then
+ 	#only output assigment of total peaks from all samples (raw peaks without evaluation)
+-	echo "$PeakOverlapNum" > $PREFIX".IntegratedSamples.bed"
++	cat $PREFIX".PeakOverlapNum" > $PREFIX".IntegratedSamples.bed"
+ 	#echo $PREFIX".IntegratedSamples.bed"
+ elif [[ "$PeakList" != "NULL" && "$RawPeakList" == "NULL" ]]; then
+-	echo "$PeakOverlapNum" > $PREFIX".IntegratedSamples.bed"
++    cat $PREFIX".PeakOverlapNum" > $PREFIX".IntegratedSamples.bed"
+ 	#sort the order of peak with identical id (-k15,15n), then select peaks by priority of poly(a) database annotating (-k13,13nr) and then DeepPASS prediction (-k14,14r).
+-	echo "$PeakOverlapNum" | sort -k15,15n -k13,13nr -k14,14r | perl -alne '$,="\t";print @F[0..$#F-2] unless $id{$F[$#F-1]}; $id{$F[$#F-1]}=1;' | sort -k1,1 -k2,2n > $PREFIX".Integrated.bed"
++    cat $PREFIX".PeakOverlapNum" | sort -k15,15n -k13,13nr -k14,14r | perl -alne '$,="\t";print @F[0..$#F-2] unless $id{$F[$#F-1]}; $id{$F[$#F-1]}=1;' | sort -k1,1 -k2,2n > $PREFIX".Integrated.bed"
+ 	#echo $PREFIX".IntegratedSamples.bed" $PREFIX".Integrated.bed"
+ else
+ 	echo "error in input peak list file parameter!"
+-	unset PeakCombine PeakCentre PeakCentrOverlap PeakOverlap PeakOverlapNum
+-	rm $PREFIX".peakcenter.bed"
++	#unset PeakCombine PeakCentre PeakCentrOverlap PeakOverlap PeakOverlapNum
++	#rm $PREFIX".PeakCombine"
++	#rm $PREFIX".peakcenter.bed"
++	#rm $PREFIX".peakcenter.intersect"
++	#rm $PREFIX".PeakCenterOverlap"
++	#rm $PREFIX".PeakOverlap"
++	#rm $PREFIX".PeakOverlapNum"
+ 	exit 1
+ fi
+ #remove temp files
+-unset PeakCombine PeakCentre PeakCentrOverlap PeakOverlap PeakOverlapNum
+-rm $PREFIX".peakcenter.bed"
++#unset PeakCombine PeakCentre PeakCentrOverlap PeakOverlap PeakOverlapNum
++unset PeakCentre PeakCentrOverlap PeakOverlap PeakOverlapNum
++#rm $PREFIX".peakcenter.bed"
++#rm $PREFIX".peakcenter.intersect"
+diff --git a/scapture_quant b/scapture_quant
+old mode 100644
+new mode 100755
+index c64e23a..41d4bb4
+--- a/scapture_quant
++++ b/scapture_quant
+@@ -100,7 +100,7 @@ fi
+ 
+ #echo -n "PASquant Step1: prepare GTF file from input PAS peak BED file. "; date
+ #filter PAS overlap in redundant annotation of genes
+-bedtools intersect -a $PAS -b $PAS -s -split -f 0.3 -wo | perl -alne '$n1=3;$n2=15; @s1=split(/\|/,$F[$n1]);@s2=split(/\|/,$F[$n2]);  next if $s1[0] eq $s2[0]; if( $s1[0] =~ /^A\W\d+\.\d+$/ & $s2[0] !~ /^A\W\d+\.\d+$/ ){print $F[$n1];};if( $s1[0] !~ /^A\W\d+\.\d+/ & $s2[0] =~ /^A\W\d+\.\d+/ ){print $F[$n2];};  if( $s1[0] !~ /^A\W\d+\.\d+$/ & $s2[0] !~ /^A\W\d+\.\d+$/ ){  if( $s1[0] =~ /\-$s2[0]/ | $s1[0] =~ /$s2[0]\-/ ){print $F[$n1];};if( $s2[0] =~ /\-$s1[0]/ | $s2[0] =~ /$s1[0]\-/ ){print $F[$n2];}; }; ' | perl -alne 'if($#ARGV==0){$g{$F[0]}=1;}else{next if $g{$F[$n1]};print;}' - $PAS | sort -k3,3 -k1,1 -k2,2n | perl -alne '$,="\t"; @s=split(/\|/,$F[3]); $gene{$s[0]}++; print @F[0..2],"$s[0]-$gene{$s[0]}",@F[4..11],split(/\|/,$F[3]);' | sort -k1,1 -k2,2n > $PREFIX".KeepPAS.metadata"
++bedtools intersect -a $PAS -b $PAS -s -split -f 0.3 -wo | perl -alne '$n1=3;$n2=15; @s1=split(/\|/,$F[$n1]);@s2=split(/\|/,$F[$n2]);  next if $s1[0] eq $s2[0]; if( $s1[0] =~ /^A\W\d+\.\d+$/ & $s2[0] !~ /^A\W\d+\.\d+$/ ){print $F[$n1];};if( $s1[0] !~ /^A\W\d+\.\d+/ & $s2[0] =~ /^A\W\d+\.\d+/ ){print $F[$n2];};  if( $s1[0] !~ /^A\W\d+\.\d+$/ & $s2[0] !~ /^A\W\d+\.\d+$/ ){  if( $s1[0] =~ /\-$s2[0]/ | $s1[0] =~ /$s2[0]\-/ ){print $F[$n1];};if( $s2[0] =~ /\-$s1[0]/ | $s2[0] =~ /$s1[0]\-/ ){print $F[$n2];}; }; ' | perl -alne 'if($#ARGV==0){$g{$F[0]}=1;}else{next if $g{$F[$n1]};print;}' - $PAS | sort -k3,3n -k1,1 -k2,2n | perl -alne '$,="\t"; @s=split(/\|/,$F[3]); $gene{$s[0]}++; print @F[0..2],"$s[0]-$gene{$s[0]}",@F[4..11],split(/\|/,$F[3]);' | sort -k1,1 -k2,2n > $PREFIX".KeepPAS.metadata"
+ cut -f 1-12 $PREFIX".KeepPAS.metadata" > $PREFIX".KeepPAS.bed"
+ cat $PREFIX".KeepPAS.bed" | perl -alne '$F[6]=$F[2];$F[7]=$F[2];$,="\t";print @F[0..11];' | bedToGenePred /dev/stdin /dev/stdout | genePredToGtf file /dev/stdin /dev/stdout | perl -alne '$s=$_;$s=~s/\/dev\/stdin/SCAPTURE/;print $s;' > $PREFIX".KeepPAS.gtf"
+ echo "scapture PASquant -- " $PREFIX".KeepPAS.metadata" $PREFIX".KeepPAS.bed"
+@@ -119,13 +119,13 @@ if [[ "$CellList" != "NULL" && "$CellType" == "NULL" ]]; then
+ 	
+ 	if [[ "$CellList" != "NULL" && "$CellList" != "FromBAM" ]]; then
+ 		FilterBamByTag I=$BAMFile O=$PREFIX".KeepCell.srt.bam" SUMMARY=$PREFIX".KeepCell.summary" TAG=CB TAG_VALUES_FILE=$PREFIX".KeepCell.txt" &> $PREFIX".KeepCell.FilterBam.log"
+-		featureCounts -M -O --largestOverlap -F GTF -t exon -g gene_id -s 1 -T 4 -R BAM -a $PREFIX".KeepPAS.gtf" -o $PREFIX".KeepCell.assigned" $PREFIX".KeepCell.srt.bam" &> /dev/null
+-		samtools sort -@ 4 $PREFIX".KeepCell.srt.bam.featureCounts.bam" -o $PREFIX".KeepCell.reassigned.bam" &> /dev/null
++		featureCounts -M -O --largestOverlap -F GTF -t exon -g gene_id -s 1 -T 6 -R BAM -a $PREFIX".KeepPAS.gtf" -o $PREFIX".KeepCell.assigned" $PREFIX".KeepCell.srt.bam" &> /dev/null
++		samtools sort -@ 6 $PREFIX".KeepCell.srt.bam.featureCounts.bam" -o $PREFIX".KeepCell.reassigned.bam" &> /dev/null
+ 		rm $PREFIX".KeepCell.srt.bam.featureCounts.bam"
+ 	fi
+ 	if [[ "$CellList" != "NULL" && "$CellList" == "FromBAM" ]]; then
+-		featureCounts -M -O --largestOverlap -F GTF -t exon -g gene_id -s 1 -T 4 -R BAM -a $PREFIX".KeepPAS.gtf" -o $PREFIX".KeepCell.assigned" $BAMFile &> /dev/null
+-		samtools sort -@ 4 "$(dirname $PREFIX)/$(basename $BAMFile).featureCounts.bam" -o $PREFIX".KeepCell.reassigned.bam" &> /dev/null
++		featureCounts -M -O --largestOverlap -F GTF -t exon -g gene_id -s 1 -T 6 -R BAM -a $PREFIX".KeepPAS.gtf" -o $PREFIX".KeepCell.assigned" $BAMFile &> /dev/null
++		samtools sort -@ 6 "$(dirname $PREFIX)/$(basename $BAMFile).featureCounts.bam" -o $PREFIX".KeepCell.reassigned.bam" &> /dev/null
+ 		rm "$(dirname $PREFIX)/$(basename $BAMFile).featureCounts.bam"
+ 	fi
+ 	#echo -n "PASquant Step3: re-assign reads to PASs. "; date	
+@@ -134,7 +134,9 @@ if [[ "$CellList" != "NULL" && "$CellType" == "NULL" ]]; then
+ 	#echo -n "PASquant Step3: done. "; date
+ 	
+ 	#echo -n "PASquant Step4: count UMIs for PASs. "; date
+-	umi_tools count --extract-umi-method=tag --umi-tag=UB --cell-tag=CB --per-gene --gene-tag=XT --assigned-status-tag=XS --per-cell --wide-format-cell-counts -I $PREFIX".KeepCell.reassigned.bam" -S $PREFIX".KeepCell.UMItools.tsv.gz" -E $PREFIX".KeepCell.UMItools.error.log" -L $PREFIX".KeepCell.UMItools.logging.log"
++    ## I modified below line for mapping quality
++	#umi_tools count --extract-umi-method=tag --umi-tag=UB --cell-tag=CB --per-gene --gene-tag=XT --assigned-status-tag=XS --per-cell --wide-format-cell-counts -I $PREFIX".KeepCell.reassigned.bam" -S $PREFIX".KeepCell.UMItools.tsv.gz" -E $PREFIX".KeepCell.UMItools.error.log" -L $PREFIX".KeepCell.UMItools.logging.log"
++	umi_tools count --mapping-quality 255 --extract-umi-method=tag --umi-tag=UB --cell-tag=CB --per-gene --gene-tag=XT --assigned-status-tag=XS --per-cell --wide-format-cell-counts -I $PREFIX".KeepCell.reassigned.bam" -S $PREFIX".KeepCell.UMItools.tsv.gz" -E $PREFIX".KeepCell.UMItools.error.log" -L $PREFIX".KeepCell.UMItools.logging.log"
+ 	zcat $PREFIX".KeepCell.UMItools.tsv.gz" | perl -alne ' if($#ARGV==0){push @allgene,$F[3];$allgenekey{$F[3]}=1;}else{ if($allgenekey{$F[0]} != 1 & $F[0] ne "gene"){ push @allgene,$F[0]; }; @cell = @F[1..$#F] if $F[0] eq "gene"; $expressed{$F[0]}=join("\t",@F[1..$#F]) if $F[0] ne "gene";}; END{ $,="\t";print @cell; for($i=0;$i<=$#allgene;$i++){ $g=substr("0\t"x($#cell+1),0,-1) unless $expressed{$allgene[$i]}; $g=$expressed{$allgene[$i]} if $expressed{$allgene[$i]}; $,="\t"; print $allgene[$i],$g;}}' $PREFIX".KeepPAS.bed" - | gzip -c - > $PREFIX".KeepCell.formatted.tsv.gz"
+ 	Rscript $SCAPTUREPATH"/scripts/Average_overlap_PAS.R" $PREFIX".KeepCell.formatted.tsv.gz" $PREFIX".KeepCell.allPAS.tsv"
+ 	zcat $PREFIX".KeepCell.allPAS.tsv.gz" | perl -alne ' if($#ARGV==0){push @allgene,$F[3];}else{$count++; @cell = @F[0..$#F] if $count == 1; $expressed{$F[0]}=join("\t",@F[1..$#F]) if $count > 1;}; END{ $,="\t";print "gene",@cell; for($i=0;$i<=$#allgene;$i++){ $g=substr("0\t"x($#cell+1),0,-1) unless $expressed{$allgene[$i]}; $g=$expressed{$allgene[$i]} if $expressed{$allgene[$i]}; $,="\t"; print $allgene[$i],$g;} }' $PREFIX".KeepPAS.bed" - | gzip -c - > $PREFIX".KeepCell.UMIs.tsv.gz"

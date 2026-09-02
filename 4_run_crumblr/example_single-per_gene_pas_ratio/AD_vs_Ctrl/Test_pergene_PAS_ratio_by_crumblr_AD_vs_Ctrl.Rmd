@@ -1,0 +1,552 @@
+---
+title: "Load crumblr, run dream"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: paged
+    highlight: default
+  html_notebook:
+    toc: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)  
+  library(ggrepel)  
+  library(BiocParallel)
+  library(SingleCellExperiment)
+  library(dreamlet)
+  library(crumblr)
+  library(jsonlite)
+  library(patchwork)
+})
+```
+
+```{r}
+CPUParam = MulticoreParam(20)
+register(CPUParam)
+```
+
+# Set params
+```{r}
+GENESIS_DATASET = 'A13_PFC'
+QUANT_LEVEL = 'PAS'
+PSB_LEVEL = 'class'
+PSB_SAMPLE_LEVEL = 'individualID'
+
+MIN_COUNT = 5 # Minimum PAS count required
+MIN_PROP = 0.2 # Required portion of samples >= MIN_COUNT to keep PAS
+
+COBJ_LIST_PATH = sprintf("../cobj_list_PAS_usage_%s_%s_%s.rds",
+                         GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+
+# Hardcode cell type order
+if (PSB_LEVEL=='class'){
+  celltypes = c('IN', 'EN', 'Oligo', 'OPC', 'Astro', 'Immune', 'Vascular')
+}
+names(celltypes) = celltypes
+
+# Repository root, three levels up from this contrast directory.
+# Paths in config.yaml are relative to it.
+CONFIG_PATH = '../../../config.yaml'
+cfg  = yaml::read_yaml(CONFIG_PATH)
+ROOT = dirname(CONFIG_PATH)
+
+PAS_BEDEVAL = file.path(ROOT, cfg$pas_info_tsv)
+```
+
+# Load PAS - Gene info
+```{r load PAS-gene}
+pas_gene_table <- read.table(PAS_BEDEVAL, sep='\t', header=1)
+pas_gene_table %>% glimpse()
+```
+
+# Load data for per cell and sample metadata 
+```{r}
+res.proc = sprintf('%s/3_run_dreamlet/example_single_%s-%s/%s_dreamlet_processed_%s_%s_%s_pseudobulk.rds',
+                    ROOT, PSB_LEVEL, QUANT_LEVEL, QUANT_LEVEL, GENESIS_DATASET, PSB_LEVEL, PSB_SAMPLE_LEVEL)
+print(res.proc)
+```
+
+```{r load metadata}
+res.proc = readRDS(res.proc)
+res.proc
+```
+
+```{r}
+df_cd = colData(res.proc)
+df_cd[[PSB_SAMPLE_LEVEL]] = rownames(df_cd)
+```
+
+# Define form
+```{r}
+cont_pairs = c(AD_vs_Ctrl = "DxADAD - DxADCtrl")
+has_contrasts = TRUE
+
+form = ~ 0 + DxAD + sex + scale(age) + scale(pmi) + log(n_genes) + percent_mito + mito_ribo + ribo_genes + (1|individualID)
+
+# If individualID level, remove individualID
+if (PSB_SAMPLE_LEVEL == 'individualID'){
+  form = update(form,  ~ . - (1|individualID))
+}
+
+# If multiple brain bank
+if (length(unique(colData(res.proc)$Source)) > 1){
+  form = update(form,  ~ . + (1|Source))
+} 
+
+print(form)
+```
+
+# Load merged crumblr objects
+```{r load cobj}
+cobj_merged_per_celltype = readRDS(COBJ_LIST_PATH)
+```
+
+# Run test
+```{r run dream}
+fit_per_celltype = lapply(celltypes, function(ct){
+  cobj_merged = cobj_merged_per_celltype[[ct]]
+  cols = colnames(cobj_merged)
+  
+  df_meta = as.data.frame(metadata(res.proc))
+  df_meta = left_join(df_meta[df_meta[[PSB_LEVEL]]==ct, ], df_cd, by=PSB_SAMPLE_LEVEL)
+  rownames(df_meta) = df_meta[[PSB_SAMPLE_LEVEL]]
+  df_meta = df_meta[cols,]
+
+  L <- if (has_contrasts) makeContrastsDream(form, df_meta, contrasts = cont_pairs) else NULL
+  
+  fit = dream(cobj_merged, form, df_meta, L = L, BPPARAM = CPUParam)
+  fit = eBayes(fit)
+  
+  return(fit)
+})
+
+cat('Number of fitted genes:\n')
+lapply(fit_per_celltype, dim)
+```
+
+```{r save dream}
+saveRDS(fit_per_celltype, 'fit_list.rds')
+```
+
+# Save toptable
+```{r}
+# Used for topTable
+#if(CONTRAST_TYPE == "ORD" ){
+#  pattern = paste0("^", ctr$variable)
+#  coef.test = grep(pattern, colnames(fit_list_per_celltype[[1]][[1]]$coefficients), value=TRUE)
+#}else{     
+#  if( any(is.null(ctr$contrasts)) || any(is.na(ctr$contrasts)) ){   
+#    coef.test = ctr$variable
+#  }else{
+#    coef.test = ctr$contrasts 
+#  }
+#}
+coef.test = names(cont_pairs) #CONTRAST_KEY
+names(coef.test) = coef.test
+print(coef.test)
+```
+
+```{r}
+FDR_CUTOFF = 0.05
+LOGFC_CUTOFF = 0
+AVG_USG_CUTOFF = 0.05
+sig_col_str = sprintf("q < %.2f & usage > %.0f%%", FDR_CUTOFF, AVG_USG_CUTOFF*100)
+
+topTable_all_list = list()
+for (coef_key in names(cont_pairs)) {
+  merged_tt_per_celltype = bplapply(celltypes, function(ct){
+    fit = fit_per_celltype[[ct]] 
+    tt = topTable(fit, coef = coef_key, number=Inf)
+    
+    rowname_split <- strsplit(rownames(tt), "#", fixed = TRUE)
+    tt$gene_name = sapply(rowname_split, `[`, 1)
+    tt$PAS_name = sapply(rowname_split, `[`, 2)
+    
+    topTable_list = lapply(unique(tt$gene_name), function(gn){
+      tt_gn = tt %>% filter(gene_name==gn)
+      logfc = tt_gn$logFC
+      half_logfc = tt_gn$logFC / 2
+      
+      tt_gn$AveUsage = t(clrInv(t(tt_gn$AveExpr)))[,1]
+      tt_gn$TestUsage = t(clrInv(t(tt_gn$AveExpr + half_logfc)))[,1]
+      tt_gn$OtherUsage = t(clrInv(t(tt_gn$AveExpr - half_logfc)))[,1]
+      
+      tt_gn$Plus1SDUsage = t(clrInv(t(tt_gn$AveExpr + logfc)))[,1]
+      tt_gn$Minus1SDUsage = t(clrInv(t(tt_gn$AveExpr - logfc)))[,1]
+      
+      return(tt_gn)
+    })
+    
+    merged_tt = do.call(rbind, topTable_list)
+    merged_tt[['adj.P.Val']] = p.adjust(merged_tt$P.Value, method='BH')
+    merged_tt <- merged_tt %>%
+     mutate(
+       SE = logFC / t,
+       CI_lower = logFC - 1.96 * SE,
+       CI_upper = logFC + 1.96 * SE,
+       SigGroup = case_when(
+         adj.P.Val < FDR_CUTOFF &  AveUsage > AVG_USG_CUTOFF ~ sig_col_str,
+         P.Value < 0.05 ~ "p < 0.05",
+         TRUE ~ "Not Significant"
+        )
+      )
+    merged_tt$assay = ct
+    return(merged_tt)
+  })
+  
+  topTable_all = do.call(rbind, merged_tt_per_celltype)
+  topTable_all = left_join(topTable_all, pas_gene_table[, c('PAS_name', 'pas_region', 'pas_subclassified')], by = 'PAS_name')
+  topTable_all$assay = factor(topTable_all$assay, levels = celltypes)
+  
+  write_tsv(topTable_all, sprintf("PAS_usage_crumblr_%s_%s_%s.tsv.gz", GENESIS_DATASET, PSB_LEVEL, coef_key))
+  topTable_all_list[[coef_key]] = topTable_all
+}
+```
+
+# Draw results - per celltype
+```{r}
+
+summary_df_list = lapply(coef.test, function(coef_key){
+  topTable_all = topTable_all_list[[coef_key]]
+  
+  summary_df <- topTable_all %>%
+    group_by(assay) %>%
+    summarise(
+      total_tested = n(),
+      sig_down = sum(adj.P.Val < FDR_CUTOFF & logFC < -LOGFC_CUTOFF &  AveUsage > AVG_USG_CUTOFF),
+      sig_up   = sum(adj.P.Val < FDR_CUTOFF & logFC > LOGFC_CUTOFF & AveUsage > AVG_USG_CUTOFF),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(cols = c(sig_down, sig_up), 
+               names_to = "direction", 
+               values_to = "sig_count") %>%
+    mutate(
+      direction = ifelse(direction == "sig_down", "Down", "Up"),
+      fraction = sig_count / total_tested
+    )
+  
+  summary_df$assay <- factor(summary_df$assay, levels = celltypes) 
+  print(summary_df)
+  summary_df  
+})
+```
+
+```{r fig.width=8, fig.height=2.5}
+
+for (coef_key in coef.test){
+  summary_df = summary_df_list[[coef_key]]
+  # N testedc
+  p1 = ggplot(summary_df, aes(y = assay, x = total_tested)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(
+      title = sprintf("%s\nNumber of tested PAS", coef_key),
+      y = "cell type",
+      x = "Number of PAS",
+      fill = "Direction"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Frac
+  p2 = ggplot(summary_df, aes(y = assay, x = fraction, fill = direction)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = c("Down" = "steelblue", "Up" = "firebrick")) +
+    labs(
+      title = "Fraction of DU PAS",
+      y = "",
+      x = "\nFraction (sig / tested)",
+      fill = "Direction"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # N sig
+  p3 = ggplot(summary_df, aes(y = assay, x = sig_count, fill = direction)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = c("Down" = "steelblue", "Up" = "firebrick")) +
+    labs(
+      title = "\nNumber of DU PAS",
+      y = "",
+      x = "Number of PAS",
+      fill = "Direction"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  
+  p_merge = p1 + p2 + p3 + plot_layout(nrow = 1)
+  ggsave(sprintf("PAS_usage_crumblr_NumTested_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), 
+         plot = p_merge, width = 8, height = 2.5)
+  print(p_merge)
+}
+```
+
+# Draw MA plot of usage differences, using percent usage
+```{r, fig.width=8, fig.height=4}
+
+# Custom fill colors
+#sig_colors <- c("q < 0.05" = "red", "p < 0.05" = "mediumpurple1", "Not Significant" = "lightskyblue1")
+sig_colors <- c("Not Significant" = "lightskyblue1",
+                "p < 0.05" = "mediumpurple", 
+                setNames("red", sig_col_str))
+# Plot
+
+for (coef_key in coef.test){
+  topTable_all = topTable_all_list[[coef_key]]
+  p <- ggplot(topTable_all, aes(x = AveUsage, y=logFC)) +
+    facet_wrap(~ assay, ncol = 4) +
+    # Jittered points
+    geom_point(
+      aes(fill=SigGroup), 
+      shape = 21, size = 1.5, stroke = NA, alpha=0.5, 
+    ) +
+    scale_fill_manual(values = sig_colors, name = "Significance") +
+    theme_bw(base_size = 10) +
+    labs(
+      title = sprintf("%s %s", GENESIS_DATASET, coef_key),
+      x = "Average usage fraction",
+      y = "logFC"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      #legend.position = "none",
+      strip.text = element_text(size = 10)
+    )
+  ggsave(sprintf("PAS_usage_crumblr_MAplot_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), plot = p, width = 8, height = 4)
+  print(p)
+}
+```
+
+# Draw volcano
+```{r, fig.width=9, fig.height=5}
+
+# Custom fill colors
+sig_colors <- c("Not Significant" = "gray",
+                "p < 0.05" = "gray", 
+                setNames("red", sig_col_str))
+for (coef_key in coef.test){
+  topTable_all = topTable_all_list[[coef_key]]
+  topTable_all$minus_log10p = -log10(topTable_all$P.Value)
+  
+  label_data <- topTable_all %>%
+    group_by(assay) %>%
+    slice_min(order_by = P.Value, n = 5, with_ties = FALSE) %>%
+    ungroup()
+  
+  label_data <- label_data %>%
+    left_join(pas_gene_table[, c("PAS_name", "visual_name")], by = "PAS_name")
+  
+  p <- ggplot(topTable_all, aes(y = minus_log10p, x=logFC)) +
+    facet_wrap(~ assay, ncol = 4) +
+    geom_point(
+      aes(fill=SigGroup), 
+      shape = 21, size = 1.5, stroke = NA, alpha=0.5, 
+    ) +
+    geom_text_repel(
+      data = label_data,
+      aes(label = visual_name),
+      size = 2.5,
+      max.overlaps = Inf,
+      segment.size = 0.2
+    ) +
+    scale_fill_manual(values = sig_colors, name = "Significance") +
+    theme_bw(base_size = 10) +
+    labs(
+      title = sprintf("%s %s", GENESIS_DATASET, coef_key),
+      x = "logFC of usage",
+      y = "-log10(p-value)"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      #legend.position = "none",
+      strip.text = element_text(size = 10)
+    )
+  ggsave(sprintf("PAS_usage_crumblr_volcano_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), plot = p, width = 9, height = 5)
+  print(p)
+}
+```
+
+# Draw results - per celltype, sub region
+```{r}
+summary_df_region_list = lapply(coef.test, function(coef_key){
+  topTable_all = topTable_all_list[[coef_key]]
+  summary_df_region <- topTable_all %>%
+    group_by(assay, pas_subclassified) %>%
+    summarise(
+      total_tested = n(),
+      sig_down = sum(adj.P.Val < FDR_CUTOFF & logFC < -LOGFC_CUTOFF &  AveUsage > AVG_USG_CUTOFF),
+      sig_up   = sum(adj.P.Val < FDR_CUTOFF & logFC > LOGFC_CUTOFF & AveUsage > AVG_USG_CUTOFF),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(cols = c(sig_down, sig_up), 
+               names_to = "direction", 
+               values_to = "sig_count") %>%
+    mutate(
+      direction = ifelse(direction == "sig_down", "Down", "Up"),
+      fraction = sig_count / total_tested
+    )
+  
+  region_order = c('5UTR', 'CDS', 'exon', 'intron', '3UTR', 'Upstream_3UTR', 'Proximal_3UTR', 'Distal_3UTR', '3primeExtended')
+  summary_df_region$pas_subclassified <- factor(summary_df_region$pas_subclassified, levels = rev(region_order))
+  summary_df_region$assay <- factor(summary_df_region$assay, levels = celltypes)
+  
+  print(summary_df_region)
+  
+  return(summary_df_region)
+})
+```
+
+```{r fig.width=6, fig.height=4}
+wi = 6
+he = 4
+for (coef_key in coef.test){
+  summary_df_region = summary_df_region_list[[coef_key]]
+
+  p = ggplot(summary_df_region, aes(y = pas_subclassified, x = total_tested)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ assay, ncol = 4) +
+    labs(
+      title = sprintf("Number of tested PAS\n%s-%s, %s", GENESIS_DATASET, PSB_LEVEL, coef_key),
+      x = "Number of PAS",
+      y = "Region",
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(sprintf("PAS_usage_crumblr_NumTested_byRegion_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), plot = p, width = wi, height = he)
+  print(p)
+}
+```
+
+```{r fig.width=8, fig.height=4}
+wi = 8
+he = 4
+for (coef_key in coef.test){
+  summary_df_region = summary_df_region_list[[coef_key]]
+  
+  p = ggplot(summary_df_region, aes(y = pas_subclassified, x = fraction, fill = direction)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ assay, ncol = 4) +
+    scale_fill_manual(values = c("Down" = "steelblue", "Up" = "firebrick")) +
+    labs(
+      title = sprintf("Fraction of significantly up / down usage PAS\n%s-%s, %s", GENESIS_DATASET, PSB_LEVEL, coef_key),
+      x = "Fraction (sig / tested)",
+      y = "Region",
+      fill = "Direction"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(sprintf("PAS_usage_crumblr_SigFrac_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), plot = p, width = wi, height = he)
+  print(p)
+}
+```
+
+```{r fig.width=8, fig.height=4}
+for (coef_key in coef.test){
+  summary_df_region = summary_df_region_list[[coef_key]]
+  
+  p = ggplot(summary_df_region, aes(y = pas_subclassified, x = sig_count, fill = direction)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ assay, ncol = 4) +
+    scale_fill_manual(values = c("Down" = "steelblue", "Up" = "firebrick")) +
+    labs(
+      title = sprintf("Number of significantly up / down usage PAS\n%s-%s, %s", GENESIS_DATASET, PSB_LEVEL, coef_key),
+      x = "Number of PAS",
+      y = "Region",
+      fill = "Direction"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(sprintf("PAS_usage_crumblr_SigN_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), plot = p, width = wi, height = he)
+  print(p)
+}
+```
+
+# Draw results - per celltype, sub region, for p sig (0.05)
+```{r}
+summary_df_region_list = lapply(coef.test, function(coef_key){
+  topTable_all = topTable_all_list[[coef_key]]
+  summary_df_region <- topTable_all %>%
+    group_by(assay, pas_subclassified) %>%
+    summarise(
+      total_tested = n(),
+      sig_down = sum(P.Value < FDR_CUTOFF  & logFC < -LOGFC_CUTOFF &  AveUsage > AVG_USG_CUTOFF),
+      sig_up   = sum(P.Value < FDR_CUTOFF & logFC > LOGFC_CUTOFF & AveUsage > AVG_USG_CUTOFF),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(cols = c(sig_down, sig_up), 
+               names_to = "direction", 
+               values_to = "sig_count") %>%
+    mutate(
+      direction = ifelse(direction == "sig_down", "Down", "Up"),
+      fraction = sig_count / total_tested
+    )
+  
+  region_order = c('5UTR', 'CDS', 'exon', 'intron', '3UTR', 'Upstream_3UTR', 'Proximal_3UTR', 'Distal_3UTR', '3primeExtended')
+  summary_df_region$pas_subclassified <- factor(summary_df_region$pas_subclassified, levels = rev(region_order))
+  summary_df_region$assay <- factor(summary_df_region$assay, levels = celltypes)
+  
+  print(summary_df_region)
+  
+  return(summary_df_region)
+})
+```
+
+
+```{r fig.width=8, fig.height=4}
+wi = 8
+he = 4
+for (coef_key in coef.test){
+  summary_df_region = summary_df_region_list[[coef_key]]
+  
+  p = ggplot(summary_df_region, aes(y = pas_subclassified, x = fraction, fill = direction)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ assay, ncol = 4) +
+    scale_fill_manual(values = c("Down" = "steelblue", "Up" = "firebrick")) +
+    labs(
+      title = sprintf("Fraction of significantly up / down usage PAS\n%s-%s, %s", GENESIS_DATASET, PSB_LEVEL, coef_key),
+      x = "Fraction (sig / tested)",
+      y = "Region",
+      fill = "Direction"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(sprintf("PAS_usage_crumblr_P-SigFrac_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), plot = p, width = wi, height = he)
+  print(p)
+}
+```
+
+```{r fig.width=8, fig.height=4}
+for (coef_key in coef.test){
+  summary_df_region = summary_df_region_list[[coef_key]]
+  
+  p = ggplot(summary_df_region, aes(y = pas_subclassified, x = sig_count, fill = direction)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ assay, ncol = 4) +
+    scale_fill_manual(values = c("Down" = "steelblue", "Up" = "firebrick")) +
+    labs(
+      title = sprintf("Number of significantly up / down usage PAS\n%s-%s, %s", GENESIS_DATASET, PSB_LEVEL, coef_key),
+      x = "Number of PAS",
+      y = "Region",
+      fill = "Direction"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(sprintf("PAS_usage_crumblr_P-SigN_%s_%s_%s.pdf", GENESIS_DATASET, PSB_LEVEL, coef_key), plot = p, width = wi, height = he)
+  print(p)
+}
+```
+
+# Session info
+```{r}
+sessionInfo()
+```
+
+
+
+
+

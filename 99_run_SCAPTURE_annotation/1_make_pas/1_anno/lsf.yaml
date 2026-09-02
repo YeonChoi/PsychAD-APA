@@ -1,0 +1,11 @@
+__default__:
+    - "-P acc_CommonMind"
+    - "-W 24:00"
+
+pas_calling:
+    - "-W 48:00"
+
+count_from_feature_count_bam:
+    - "-q express"
+    - "-W 8:00"
+

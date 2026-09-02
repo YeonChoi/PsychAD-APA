@@ -1,0 +1,5 @@
+__default__:
+    - "-P acc_CommonMind"
+    - "-W 48:00"
+
+

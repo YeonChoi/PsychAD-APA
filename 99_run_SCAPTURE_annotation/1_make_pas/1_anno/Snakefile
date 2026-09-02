@@ -1,0 +1,42 @@
+import os
+import pandas as pd
+import glob 
+import random 
+import sys
+
+ROOT = Path(workflow.basedir).parents[2]
+configfile: str(ROOT / 'config.yaml')
+
+# Reference file paths. 
+FASTA='/sc/arion/projects/CommonMind/yeon/p/APA/ref/GRCh38.nochr/GRCh38.primary_assembly.genome.fa'
+CHR_SIZE='/sc/arion/projects/CommonMind/yeon/p/APA/ref/GRCh38.nochr/GRCh38.primary_assembly.chrsizes'
+ORG_GTF='/sc/arion/projects/CommonMind/yeon/p/APA/ref/ensembl.104/Homo_sapiens.GRCh38.104.filt_renamed.gtf'
+
+# PolyA Databased given by SCAPTURE. GENCODE + 3 studies
+POLYA_DB='/sc/arion/projects/CommonMind/yeon/p/APA/ref/SCAPTURE/SupTab_KnownPASs_fourDBs_nochr.txt'
+
+# Annotation will be made by SCAPTURE
+ANNO_NAME='SCAPTURE_ensembl.104'
+
+
+targets = [
+    f'{ANNO_NAME}.chromsize' # chromsize is the last anno file made by SCAPTURE
+]
+
+
+wildcard_constraints:
+    sample="[^.]*" # Wildcard sample never includes '.'
+
+localrules: all
+
+rule all:
+    input: targets
+
+rule generate_annotations:
+    output: f'{ANNO_NAME}.chromsize' # chromsize is the last anno file made by SCAPTURE
+    conda: config['scapture_env']
+    threads: 3
+    resources:
+        mem_mb=2000
+    shell: 
+        f"scapture -m annotation -o {ANNO_NAME} -g {FASTA} --gtf {ORG_GTF} --cs {CHR_SIZE} --extend 2000 "
