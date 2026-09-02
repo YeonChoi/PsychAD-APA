@@ -7,15 +7,15 @@ The pipeline calls and quantifies polyadenylation sites (PAS) per cell type and
 donor with [SCAPTURE](https://github.com/YangLab/SCAPTURE), then tests them for
 differential expression (dreamlet) and differential usage (crumblr).
 
-> **Scope of this repository.** This is a cleaned version of the analysis.
-> The exact code and parameters used to produce the published figures
-> are archived separately at [Zenodo DOI, TBD].
+ **Scope of this repository.** This is a cleaned version of the analysis.
+ The exact code and parameters used to produce the published figures
+ are archived separately at [Zenodo DOI, TBD].
 
 ---
 
 ## Quick start
 
-Install SCAPTURE, subread, umi_tools separately — see [Prerequisites](#prerequisites).
+Install SCAPTURE, subread, samtools separately — see [Prerequisites](#prerequisites).
 
 ```bash
 # 1. Python/R environment
@@ -43,7 +43,7 @@ The main pipeline is in `2_run_SCAPTURE_quant`, which generates a single-cell PA
 | `config.yaml` | All input/output paths | 🟡 |
 | `conda_base_APA.no-builds.yaml` | Python/R environment for Snakemake and the notebooks | 🟢 |
 | `helpers/` | Shared Python utilities imported by the notebooks and Snakefiles | 🟢 |
-| `ref/` | PAS annotation called on this cohort (BED12 + per-PAS metadata) | 🟢 |
+| `ref/` | PAS annotation called on PsychAD (BED12 + per-PAS metadata) | 🟢 |
 | `1_barcode_tables/` | **Stage 1** - build the cell-barcode / BAM-path table from a gene-level h5ad | 🟡 |
 | `2_run_SCAPTURE_quant/` | **Stage 2 (main)** - SCAPTURE PASquant per Channel (Snakemake), then merge to a PAS h5ad and pseudobulk (notebooks) | 🟢 |
 | `3_run_dreamlet/` | **Stage 3** - differential expression with dreamlet (R Markdown) | 🟡 |
@@ -58,13 +58,13 @@ The main pipeline is in `2_run_SCAPTURE_quant`, which generates a single-cell PA
 
 ### Must be on `$PATH`
 
-Install SCAPTURE in a conda environment, following its own instructions, then
-put that environment's name in scapture_env in config.yaml (default: SCAPTURE_env):
-https://github.com/YangLab/SCAPTURE
+Install SCAPTURE in a conda environment, following the
+[SCAPTURE instructions](https://github.com/YangLab/SCAPTURE). Then set
+`scapture_env` in `config.yaml` to that environment's name (default: `SCAPTURE_env`).
 
 | tool | version used here |
 |---|---|
-| scapture | v1.1 (optionally + `scapture_modifications.diff`, see below) |
+| scapture | v1.1 (optionally + `modifications_on_scapture.diff`, see below) |
 | bedtools | 2.26.0 (pinned by SCAPTURE) |
 | featureCounts (subread) | 1.6.3 |
 | samtools | 1.21 |
@@ -141,6 +141,8 @@ such as `.csv` and `.tsv` are also accepted.
 
 ### 2. PAS quantification
 
+#### Snakemake
+
 Make sure all file paths in `config.yaml` are correct, then:
 
 ```bash
@@ -153,8 +155,7 @@ cd 2_run_SCAPTURE_quant && ./run_snake_mount-sinai_lsf.sh
 One SCAPTURE `PASquant` job per `Channel`. Outputs land in
 `counts/{channel}/{channel}.KeepCell.UMIs.tsv.gz`, plus a per-channel
 `.KeepPAS.metadata` (the PAS annotation after SCAPTURE's overlap filtering and
-renaming — identical across channels) and read-assignment stats in
-`stats/merged_count.txt`.
+renaming — identical across channels).
 
 `run_snake_mount-sinai_lsf.sh` and `lsf.yaml` are written for Mount Sinai LSF. Modify according to your environment.
 
@@ -163,7 +164,9 @@ renaming — identical across channels) and read-assignment stats in
 Per Channel `scapture_pas_quant` takes ~5.6 CPU-hours on 6 threads, but varies
 widely (9–175 min wall-clock).
 
-Then, in `2_run_SCAPTURE_quant/ipynb/`:
+#### ipynb
+
+In `2_run_SCAPTURE_quant/ipynb/`:
 
 - `1_make_h5ad_and_pseudobulk_tables.ipynb` — per-channel counts → merged single-cell PAS `.h5ad` → pseudobulk CSVs per cell type
 - `2_Sum_Channel_counts_to_merged_level.ipynb` — sum Channels up to donor level
@@ -171,15 +174,16 @@ Then, in `2_run_SCAPTURE_quant/ipynb/`:
 
 #### What you get
 
-| path | contents |
-|---|---|
-| `counts/{channel}/{channel}.KeepCell.UMIs.tsv.gz` | PAS x cell UMI counts, one file per Channel |
-| `stats/merged_count.txt` | reads assigned / unassigned per Channel |
-| `singlecell_counts/*_PAS.h5ad` | all Channels merged into one single-cell PAS object |
-| `singlecell_counts/PAS_info_for_rowdata_all.csv.gz` | PAS coordinates, gene names and PAS groups (the `.var` table) |
-| `psb/count_no_cutoff/{class,subclass,subtype}/PAS_read_count_{celltype}_{level}.csv.gz` | pseudobulk PAS counts, per cell type, at Channel and donor level |
-
-The pseudobulk CSVs are the input to stages 3 and 4.
+- `counts/{channel}/{channel}.KeepCell.UMIs.tsv.gz`
+  PAS x cell UMI counts, one file per Channel
+- `stats/merged_count.txt`
+  reads assigned / unassigned per Channel
+- `singlecell_counts/*_PAS.h5ad`
+  all Channels merged into one single-cell PAS object
+- `singlecell_counts/PAS_info_for_rowdata_all.csv.gz`
+  PAS coordinates, gene names and PAS groups (the `.var` table)
+- `psb/count_no_cutoff/{class,subclass,subtype}/PAS_read_count_{celltype}_{level}.csv.gz`
+  pseudobulk PAS counts, per cell type, at Channel and donor level
 
 ### 3. Differential expression (dreamlet)
 
@@ -187,13 +191,13 @@ The pseudobulk CSVs are the input to stages 3 and 4.
 > directory layout of our HPC and model formulas specific to our hypotheses, and
 > are meant to be read and adapted, not executed unchanged.
 
-See instructions of [dreamlet](https://gabrielhoffman.github.io/dreamlet/) for more details.
+See the [dreamlet](https://gabrielhoffman.github.io/dreamlet/) documentation for more details.
 
 `3_run_dreamlet/` — `run_dreamlet_voom-{Gene,PAS}.Rmd` builds pseudobulk and runs voom; the `AD_vs_Ctrl/`, `BRAAK/`, `CERAD/` subdirectories run one contrast each.
 
 ### 4. Differential usage (crumblr)
 
-See instructions of [crumblr](https://gabrielhoffman.github.io/crumblr/index.html) and [drean](https://gabrielhoffman.github.io/variancePartition/index.html) for more details.
+See the [crumblr](https://gabrielhoffman.github.io/crumblr/index.html) and [dream](https://gabrielhoffman.github.io/variancePartition/articles/dream.html) documentation for more details.
 
 `4_run_crumblr/` — `makeCrumblr_pergene_PAS_ratio.Rmd` converts PAS counts to
 within-gene compositional ratios (CLR); the contrast subdirectories test them.
@@ -208,7 +212,7 @@ index shift.
 
 ---
 
-## 99. PAS annotation
+### 99. PAS annotation
 
 The two files in `ref/` were produced by this stage. You only need it if you want
 to call PAS on your own cohort instead of reusing ours.
